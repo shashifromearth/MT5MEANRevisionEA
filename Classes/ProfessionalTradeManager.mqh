@@ -48,12 +48,31 @@ private:
    TRADE_MANAGEMENT_STATE m_State;
    bool m_PartialTaken;
    double m_PartialPrice;
-   double m_PartialPercent; // 30-50%
-   double m_PartialDistance; // 25-40% of distance to mean
+   double m_PartialPercent; // 25-30% (reduced from 40%)
+   double m_PartialDistance; // 50-60% of distance to mean (increased from 35%)
+   
+   // Multiple partial levels
+   bool m_Partial1Taken;  // First partial (25% at 50% distance)
+   bool m_Partial2Taken;  // Second partial (25% at 75% distance)
+   double m_Partial1Price;
+   double m_Partial2Price;
+   
+   // Trailing stop
+   bool m_TrailingStopActive;
+   double m_TrailingStopPrice;
+   double m_HighestProfit;  // Track highest profit for trailing
+   
+   // Breakeven stop
+   bool m_BreakevenSet;
+   double m_StopLossPrice;
+   
+   // Structure break confirmation
+   int m_StructureBreakCandles;  // Count candles beyond structure
    
    // Trend continuation tracking
    bool m_TrendContinuationDetected;
    datetime m_LastCheckTime;
+   int m_StrongImpulseCount;  // Count strong impulses (require 2-3)
    
    // VWAP tracking
    bool m_VWAPFirstTouch;
@@ -68,6 +87,9 @@ private:
    bool IsStrongImpulsiveCandle(bool isLong);
    bool HasFollowThroughCandle(bool isLong);
    bool FailedToReclaimMidLevel(bool isLong, double midLevel);
+   void UpdateTrailingStop(double currentPrice);
+   void SetBreakevenStop();
+   bool CheckMultiplePartials(double currentPrice);
    
 public:
    CProfessionalTradeManager(string symbol, CLogger* logger, CMeanCalculator* meanCalculator);
@@ -106,8 +128,19 @@ CProfessionalTradeManager::CProfessionalTradeManager(string symbol, CLogger* log
    m_PartialPrice = 0;
    m_PartialPercent = 0;
    m_PartialDistance = 0;
+   m_Partial1Taken = false;
+   m_Partial2Taken = false;
+   m_Partial1Price = 0;
+   m_Partial2Price = 0;
+   m_TrailingStopActive = false;
+   m_TrailingStopPrice = 0;
+   m_HighestProfit = 0;
+   m_BreakevenSet = false;
+   m_StopLossPrice = 0;
+   m_StructureBreakCandles = 0;
    m_TrendContinuationDetected = false;
    m_LastCheckTime = 0;
+   m_StrongImpulseCount = 0;
    m_VWAPFirstTouch = false;
    m_VWAPRejected = false;
    m_VWAPTouchPrice = 0;
@@ -159,9 +192,24 @@ void CProfessionalTradeManager::InitializeTrade(ulong ticket, bool isLong, doubl
       m_EntryStructureLow = entryPrice - distanceToMean * 0.1;
    }
    
-   // Calculate partial distance (25-40% of distance to mean)
-   m_PartialDistance = distanceToMean * 0.35; // 35% average
-   m_PartialPercent = 0.40; // 40% of position
+   // IMPROVED: Calculate partial distance (50-60% of distance to mean)
+   // Increased from 35% to let winners run longer
+   m_PartialDistance = distanceToMean * 0.55; // 55% (increased from 35%)
+   m_PartialPercent = 0.25; // 25% of position (reduced from 40% to keep more for bigger wins)
+   
+   // Initialize multiple partial levels
+   m_Partial1Taken = false;
+   m_Partial2Taken = false;
+   m_TrailingStopActive = false;
+   m_BreakevenSet = false;
+   m_StructureBreakCandles = 0;
+   m_StrongImpulseCount = 0;
+   
+   // Get initial stop loss
+   if(PositionSelectByTicket(ticket))
+   {
+      m_StopLossPrice = PositionGetDouble(POSITION_SL);
+   }
    
    (*m_Logger).LogInfo(StringFormat("Trade initialized: Entry=%.5f, Target=%.5f, Partial at %.5f (%.0f%% of distance)", 
                                     entryPrice, targetMean, entryPrice + (isLong ? m_PartialDistance : -m_PartialDistance),
@@ -186,60 +234,17 @@ void CProfessionalTradeManager::ManageTrade()
                          SymbolInfoDouble(m_Symbol, SYMBOL_BID) : 
                          SymbolInfoDouble(m_Symbol, SYMBOL_ASK);
    
-   // Layer 1: Partial Profit Rule (NON-NEGOTIABLE)
-   if(!m_PartialTaken)
+   // IMPROVED Layer 1: Multiple Partial Profit Levels (Scale Out)
+   // Check multiple partial levels: 25% at 50%, 25% at 75%, 50% at mean
+   CheckMultiplePartials(currentPrice);
+   
+   // Update trailing stop if partial taken
+   if(m_PartialTaken || m_Partial1Taken)
    {
-      double priceMoved = m_IsLong ? (currentPrice - m_EntryPrice) : (m_EntryPrice - currentPrice);
-      double partialTarget = m_IsLong ? 
-                            (m_EntryPrice + m_PartialDistance) : 
-                            (m_EntryPrice - m_PartialDistance);
-      
-      // Check if price reached 25-40% of distance to mean OR first opposing structure
-      bool reachedPartialDistance = m_IsLong ? 
-                                    (currentPrice >= partialTarget) : 
-                                    (currentPrice <= partialTarget);
-      
-      // Check for first opposing structure (swing high/low)
-      bool hitOpposingStructure = false;
-      if(m_IsLong)
+      UpdateTrailingStop(currentPrice);
+      if(!m_BreakevenSet)
       {
-         // For long: check if hit swing high (opposing structure)
-         double high[];
-         ArraySetAsSeries(high, true);
-         if(CopyHigh(m_Symbol, PERIOD_M5, 0, 3, high) >= 3)
-         {
-            double recentHigh = high[ArrayMaximum(high, 0, 3)];
-            if(currentPrice >= recentHigh * 0.999) // Within 0.1%
-            {
-               hitOpposingStructure = true;
-            }
-         }
-      }
-      else
-      {
-         // For short: check if hit swing low (opposing structure)
-         double low[];
-         ArraySetAsSeries(low, true);
-         if(CopyLow(m_Symbol, PERIOD_M5, 0, 3, low) >= 3)
-         {
-            double recentLow = low[ArrayMinimum(low, 0, 3)];
-            if(currentPrice <= recentLow * 1.001) // Within 0.1%
-            {
-               hitOpposingStructure = true;
-            }
-         }
-      }
-      
-      if(reachedPartialDistance || hitOpposingStructure)
-      {
-         if(TakePartialProfit(m_PartialPercent))
-         {
-            m_PartialTaken = true;
-            m_PartialPrice = currentPrice;
-            m_State = TM_PARTIAL_TAKEN;
-            (*m_Logger).LogInfo(StringFormat("✅ Partial profit taken: %.0f%% at %.5f - Green trade guaranteed", 
-                                           m_PartialPercent * 100, currentPrice));
-         }
+         SetBreakevenStop();
       }
    }
    
@@ -324,6 +329,7 @@ bool CProfessionalTradeManager::TakePartialProfit(double percent)
 
 //+------------------------------------------------------------------+
 //| Check structure break (invalidation-based exit)                   |
+//| IMPROVED: Requires 2 candles to confirm (reduces false exits)     |
 //+------------------------------------------------------------------+
 bool CProfessionalTradeManager::CheckStructureBreak()
 {
@@ -331,64 +337,77 @@ bool CProfessionalTradeManager::CheckStructureBreak()
                         SymbolInfoDouble(m_Symbol, SYMBOL_BID) : 
                         SymbolInfoDouble(m_Symbol, SYMBOL_ASK);
    
-   // Get current candle close
+   // Get last 2 candle closes for confirmation
    double close[];
    ArraySetAsSeries(close, true);
-   if(CopyClose(m_Symbol, PERIOD_M5, 0, 1, close) < 1)
+   if(CopyClose(m_Symbol, PERIOD_M5, 0, 2, close) < 2)
       return false;
    
-   double candleClose = close[0];
+   double candleClose0 = close[0]; // Current candle
+   double candleClose1 = close[1]; // Previous candle
    
-   // Check if broke entry structure
+   bool brokeStructure = false;
+   
+   // Check if broke entry structure (require 2 candles)
    if(m_IsLong)
    {
-      // Long: exit if closes below entry structure low
-      if(candleClose < m_EntryStructureLow)
+      // Long: exit if 2 candles close below entry structure low
+      if(candleClose0 < m_EntryStructureLow && candleClose1 < m_EntryStructureLow)
       {
-         (*m_Logger).LogWarning(StringFormat("Structure break: Closed below entry structure (%.5f < %.5f)", 
-                                           candleClose, m_EntryStructureLow));
-         return true;
+         brokeStructure = true;
+         (*m_Logger).LogWarning("Structure break (confirmed): 2 candles below entry structure");
       }
       
-      // Check if broke London reaction low
-      if(m_LondonReactionLow > 0 && candleClose < m_LondonReactionLow)
+      // Check if broke London reaction low (require 2 candles)
+      if(m_LondonReactionLow > 0 && candleClose0 < m_LondonReactionLow && candleClose1 < m_LondonReactionLow)
       {
-         (*m_Logger).LogWarning(StringFormat("Structure break: Closed below London reaction low (%.5f < %.5f)", 
-                                           candleClose, m_LondonReactionLow));
-         return true;
+         brokeStructure = true;
+         (*m_Logger).LogWarning("Structure break (confirmed): 2 candles below London reaction low");
       }
    }
    else
    {
-      // Short: exit if closes above entry structure high
-      if(candleClose > m_EntryStructureHigh)
+      // Short: exit if 2 candles close above entry structure high
+      if(candleClose0 > m_EntryStructureHigh && candleClose1 > m_EntryStructureHigh)
       {
-         (*m_Logger).LogWarning(StringFormat("Structure break: Closed above entry structure (%.5f > %.5f)", 
-                                           candleClose, m_EntryStructureHigh));
-         return true;
+         brokeStructure = true;
+         (*m_Logger).LogWarning("Structure break (confirmed): 2 candles above entry structure");
       }
       
-      // Check if broke London reaction high
-      if(m_LondonReactionHigh > 0 && candleClose > m_LondonReactionHigh)
+      // Check if broke London reaction high (require 2 candles)
+      if(m_LondonReactionHigh > 0 && candleClose0 > m_LondonReactionHigh && candleClose1 > m_LondonReactionHigh)
       {
-         (*m_Logger).LogWarning(StringFormat("Structure break: Closed above London reaction high (%.5f > %.5f)", 
-                                           candleClose, m_LondonReactionHigh));
-         return true;
+         brokeStructure = true;
+         (*m_Logger).LogWarning("Structure break (confirmed): 2 candles above London reaction high");
       }
    }
    
-   return false;
+   return brokeStructure;
 }
 
 //+------------------------------------------------------------------+
 //| Detect trend continuation (hard exit)                            |
+//| IMPROVED: Requires 2-3 strong impulses (less aggressive)         |
 //+------------------------------------------------------------------+
 bool CProfessionalTradeManager::DetectTrendContinuation()
 {
-   // Trend continuation = Strong impulsive candle + follow-through + failure to reclaim mid-level
+   // IMPROVED: Require 2-3 strong impulses instead of just 1
+   // This reduces false exits during normal retracements
    
    // Check 1: Strong impulsive candle with trend
-   if(!IsStrongImpulsiveCandle(m_IsLong))
+   if(IsStrongImpulsiveCandle(m_IsLong))
+   {
+      m_StrongImpulseCount++;
+   }
+   else
+   {
+      // Reset if no strong impulse (allows some retracements)
+      if(m_StrongImpulseCount > 0)
+         m_StrongImpulseCount = MathMax(0, m_StrongImpulseCount - 1);
+   }
+   
+   // Require at least 2 strong impulses
+   if(m_StrongImpulseCount < 2)
    {
       return false;
    }
@@ -407,7 +426,8 @@ bool CProfessionalTradeManager::DetectTrendContinuation()
    }
    
    // All conditions met = trend resumed
-   (*m_Logger).LogWarning("Trend continuation: Strong impulse + follow-through + failed to reclaim mid");
+   (*m_Logger).LogWarning(StringFormat("Trend continuation: %d strong impulses + follow-through + failed to reclaim mid", 
+                                      m_StrongImpulseCount));
    return true;
 }
 
@@ -603,6 +623,186 @@ string CProfessionalTradeManager::GetExitReason()
 }
 
 //+------------------------------------------------------------------+
+//| Check multiple partial profit levels (scale out)                 |
+//+------------------------------------------------------------------+
+bool CProfessionalTradeManager::CheckMultiplePartials(double currentPrice)
+{
+   double priceMoved = m_IsLong ? (currentPrice - m_EntryPrice) : (m_EntryPrice - currentPrice);
+   double distancePercent = (m_DistanceToMean > 0) ? (priceMoved / m_DistanceToMean) : 0;
+   
+   // Partial 1: 25% at 50% of distance to mean
+   if(!m_Partial1Taken && distancePercent >= 0.50)
+   {
+      if(TakePartialProfit(0.25))
+      {
+         m_Partial1Taken = true;
+         m_Partial1Price = currentPrice;
+         m_PartialTaken = true; // Mark as partial taken
+         m_State = TM_PARTIAL_TAKEN;
+         (*m_Logger).LogInfo(StringFormat("✅ Partial 1 taken: 25%% at 50%% distance (%.5f)", currentPrice));
+      }
+   }
+   
+   // Partial 2: 25% at 75% of distance to mean
+   if(m_Partial1Taken && !m_Partial2Taken && distancePercent >= 0.75)
+   {
+      if(TakePartialProfit(0.25))
+      {
+         m_Partial2Taken = true;
+         m_Partial2Price = currentPrice;
+         (*m_Logger).LogInfo(StringFormat("✅ Partial 2 taken: 25%% at 75%% distance (%.5f)", currentPrice));
+      }
+   }
+   
+   // Final: Remaining 50% at mean (target)
+   if(m_Partial1Taken && m_Partial2Taken && distancePercent >= 0.95)
+   {
+      // Close remaining position at mean
+      if(PositionSelectByTicket(m_PositionTicket))
+      {
+         double remainingVolume = PositionGetDouble(POSITION_VOLUME);
+         if(remainingVolume > 0)
+         {
+            MqlTradeRequest request = {};
+            MqlTradeResult result = {};
+            request.action = TRADE_ACTION_DEAL;
+            request.symbol = m_Symbol;
+            request.volume = remainingVolume;
+            request.type = m_IsLong ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+            request.position = m_PositionTicket;
+            request.deviation = 10;
+            request.magic = 123456;
+            request.comment = "Final exit at mean target";
+            
+            if(OrderSend(request, result))
+            {
+               (*m_Logger).LogInfo(StringFormat("✅ Final exit: 50%% at mean target (%.5f)", currentPrice));
+               return true;
+            }
+         }
+      }
+   }
+   
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Update trailing stop                                              |
+//+------------------------------------------------------------------+
+void CProfessionalTradeManager::UpdateTrailingStop(double currentPrice)
+{
+   if(!PositionSelectByTicket(m_PositionTicket))
+      return;
+   
+   double currentProfit = m_IsLong ? 
+                         (currentPrice - m_EntryPrice) : 
+                         (m_EntryPrice - currentPrice);
+   
+   // Track highest profit
+   if(currentProfit > m_HighestProfit)
+   {
+      m_HighestProfit = currentProfit;
+   }
+   
+   // Activate trailing stop if profit > 20 pips
+   double point = SymbolInfoDouble(m_Symbol, SYMBOL_POINT);
+   double minProfit = 20 * point * 10; // 20 pips
+   
+   if(m_HighestProfit > minProfit)
+   {
+      // Calculate trailing stop: 25-30 pips behind highest profit
+      double trailDistance = 25 * point * 10; // 25 pips
+      double newStopLoss = 0;
+      
+      if(m_IsLong)
+      {
+         newStopLoss = currentPrice - trailDistance;
+         // Only move stop up, never down
+         if(newStopLoss > m_TrailingStopPrice || m_TrailingStopPrice == 0)
+         {
+            m_TrailingStopPrice = newStopLoss;
+            // Update position stop loss
+            MqlTradeRequest request = {};
+            MqlTradeResult result = {};
+            request.action = TRADE_ACTION_SLTP;
+            request.symbol = m_Symbol;
+            request.position = m_PositionTicket;
+            request.sl = m_TrailingStopPrice;
+            request.tp = PositionGetDouble(POSITION_TP);
+            request.magic = 123456;
+            
+            if(OrderSend(request, result))
+            {
+               m_TrailingStopActive = true;
+            }
+         }
+      }
+      else
+      {
+         newStopLoss = currentPrice + trailDistance;
+         // Only move stop down, never up
+         if(newStopLoss < m_TrailingStopPrice || m_TrailingStopPrice == 0)
+         {
+            m_TrailingStopPrice = newStopLoss;
+            // Update position stop loss
+            MqlTradeRequest request = {};
+            MqlTradeResult result = {};
+            request.action = TRADE_ACTION_SLTP;
+            request.symbol = m_Symbol;
+            request.position = m_PositionTicket;
+            request.sl = m_TrailingStopPrice;
+            request.tp = PositionGetDouble(POSITION_TP);
+            request.magic = 123456;
+            
+            if(OrderSend(request, result))
+            {
+               m_TrailingStopActive = true;
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Set breakeven stop (eliminate risk after partial)                |
+//+------------------------------------------------------------------+
+void CProfessionalTradeManager::SetBreakevenStop()
+{
+   if(!PositionSelectByTicket(m_PositionTicket))
+      return;
+   
+   double currentPrice = m_IsLong ? 
+                        SymbolInfoDouble(m_Symbol, SYMBOL_BID) : 
+                        SymbolInfoDouble(m_Symbol, SYMBOL_ASK);
+   
+   // Check if price moved enough to set breakeven (10-15 pips profit)
+   double point = SymbolInfoDouble(m_Symbol, SYMBOL_POINT);
+   double minProfit = 10 * point * 10; // 10 pips
+   double priceMoved = m_IsLong ? (currentPrice - m_EntryPrice) : (m_EntryPrice - currentPrice);
+   
+   if(priceMoved >= minProfit)
+   {
+      // Set stop loss to entry price (breakeven)
+      double breakevenSL = m_EntryPrice;
+      
+      MqlTradeRequest request = {};
+      MqlTradeResult result = {};
+      request.action = TRADE_ACTION_SLTP;
+      request.symbol = m_Symbol;
+      request.position = m_PositionTicket;
+      request.sl = breakevenSL;
+      request.tp = PositionGetDouble(POSITION_TP);
+      request.magic = 123456;
+      
+      if(OrderSend(request, result))
+      {
+         m_BreakevenSet = true;
+         (*m_Logger).LogInfo("✅ Breakeven stop set - Risk eliminated");
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
 //| Reset trade manager                                              |
 //+------------------------------------------------------------------+
 void CProfessionalTradeManager::Reset()
@@ -611,7 +811,18 @@ void CProfessionalTradeManager::Reset()
    m_EntryPrice = 0;
    m_State = TM_NONE;
    m_PartialTaken = false;
+   m_Partial1Taken = false;
+   m_Partial2Taken = false;
+   m_Partial1Price = 0;
+   m_Partial2Price = 0;
+   m_TrailingStopActive = false;
+   m_TrailingStopPrice = 0;
+   m_HighestProfit = 0;
+   m_BreakevenSet = false;
+   m_StopLossPrice = 0;
+   m_StructureBreakCandles = 0;
    m_TrendContinuationDetected = false;
+   m_StrongImpulseCount = 0;
    m_VWAPFirstTouch = false;
    m_VWAPRejected = false;
 }
