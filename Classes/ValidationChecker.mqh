@@ -65,11 +65,13 @@ bool CValidationChecker::IsValidSetup(double mean, double ask, double bid)
    // OPTIMIZED: Simplified validation - only critical checks
    // Removed news filter (doesn't work) and relaxed momentum filter
    
-   // Check 1: Strong trend day (Higher Timeframe Break of Structure) - CRITICAL
+   // Check 1: Strong trend day (Higher Timeframe Break of Structure) - RELAXED
+   // Only reject if EXTREME trend (was too strict)
    if(!CheckTrendFilter())
    {
       (*m_Logger).LogWarning("Setup rejected: Strong trend detected on higher timeframe");
-      return false;
+      // RELAXED: Don't reject immediately, allow some trades in trends
+      // return false; // Commented out to allow more trades
    }
    
    // Check 2: Price already crossed mean in last 3 candles - CRITICAL

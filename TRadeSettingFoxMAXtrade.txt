@@ -1,0 +1,29 @@
+Changes made to allow more trades
+1. Made exhaustion and rejection optional (default: false)
+Changed RequireExhaustion = false (was true)
+Changed RequireRejection = false (was true)
+These were blocking all trades when not detected
+2. Increased tolerance for "near" key levels
+Before: Fixed 15 pips
+Now: Dynamic based on ATR or 0.3% of price (whichever is larger)
+Allows price to be considered "near" high/low/mid more often
+3. Relaxed Risk:Reward requirement
+Before: Minimum 1:1 RR (too strict)
+Now: Minimum 0.7:1 RR (allows more trades)
+Maximum increased from 2.5 to 3.0
+4. Relaxed trend filter
+Before: Rejected all trades in trending markets
+Now: Only logs warning, doesn't reject (allows trades in trends)
+5. Enhanced logging
+More detailed logs to identify which filter blocks trades
+Enable EnableDetailedLog = true to see rejection reasons
+Expected results
+More trade opportunities (exhaustion/rejection no longer mandatory)
+Better level detection (larger tolerance zone)
+More flexible RR (0.7:1 minimum)
+Trades allowed in trending markets
+Recommendations
+Enable detailed logging: Set EnableDetailedLog = true to see why trades are rejected
+Consider trading all day: Set TradeAllDay = true if you want trades outside London session
+Monitor performance: After backtesting, adjust filters based on results
+The EA should now take trades. Run a backtest and check the logs to see which setups are being detected.

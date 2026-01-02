@@ -186,12 +186,12 @@ bool CRiskManager::ValidateRiskReward(bool isLong, double entryPrice, double sto
 {
    double rr = CalculateRiskReward(isLong, entryPrice, stopLoss, takeProfit);
    
-   // IMPROVED: Require minimum 1:1 RR (STRICT - was 0.5-2.5)
-   // Only take trades with at least 1:1 risk:reward for profitability
-   // Maximum 2.5 to avoid unrealistic targets
-   if(rr < 1.0 || rr > 2.5)
+   // RELAXED: Require minimum 0.7:1 RR (was 1.0:1 - too strict)
+   // Allow trades with at least 0.7:1 risk:reward for more opportunities
+   // Maximum 3.0 to allow reasonable targets
+   if(rr < 0.7 || rr > 3.0)
    {
-      (*m_Logger).LogWarning(StringFormat("RR validation failed: %.2f (required: 1.0-2.5, minimum 1:1)", rr));
+      (*m_Logger).LogWarning(StringFormat("RR validation failed: %.2f (required: 0.7-3.0, minimum 0.7:1)", rr));
       return false;
    }
    
@@ -380,9 +380,10 @@ bool CRiskManager::CheckTradeDuration(ulong ticket)
    datetime currentTime = TimeCurrent();
    int durationMinutes = (int)((currentTime - m_EntryTime) / 60);
    
-   // FLEXIBLE: Max trade duration increased to 3 hours (180 minutes)
+   // FLEXIBLE: Max trade duration (configurable, default 3 hours = 180 minutes)
    // Mean reversion trades need time to develop
-   if(durationMinutes <= 180) return false; // Let trades run for up to 3 hours
+   int maxDurationMinutes = 180; // Default 3 hours - can be made configurable
+   if(durationMinutes <= maxDurationMinutes) return false; // Let trades run for up to max duration
    
    // After 3 hours, only close if trade is losing AND not moving toward target
    double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);

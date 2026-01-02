@@ -25,43 +25,84 @@
 #include "Classes/LiquidityMagnet.mqh"
 #include "Classes/ProfessionalTradeManager.mqh"
 #include "Classes/RejectionDetector.mqh"
+#include "Classes/TelegramAlert.mqh"
 
 //+------------------------------------------------------------------+
-//| Input Parameters                                                 |
+//| Input Parameters - Highly Customizable                          |
 //+------------------------------------------------------------------+
-input string   TRADE_SETTINGS    = "--- Trade Settings ---";
-input double   LotSize           = 1.0;
-input bool     UseMoneyManagement = false;
-input double   RiskPercent       = 1.0;
-input string   Symbol1           = "EURUSD";
-input string   Symbol2           = "GBPUSD";
 
-input string   MEAN_SETTINGS     = "--- Mean Calculation ---";
-input MEAN_TYPE MeanMethod       = ASIAN_MIDPOINT;
-input bool     UseATRFilter      = true;
+//=== TRADE QUANTITY & POSITION SIZING ===
+input group "=== Trade Quantity Settings ===";
+input double   LotSize           = 0.10;   // Fixed lot size (0.10 = micro lot, recommended for $10K account)
+input bool     UseMoneyManagement = false; // If true, use risk-based position sizing
+input double   RiskPercentPerTrade = 0.75; // Risk % per trade (if UseMoneyManagement = true)
 
-input string   EXIT_SETTINGS     = "--- Exit Settings ---";
-input TP_METHOD TakeProfitMethod = TO_MEAN;
-input bool     UseAutoCloseRule  = true;
+//=== DAILY TRADE LIMITS ===
+input group "=== Daily Trade Limits ===";
+input int      MaxTradesPerDay  = 3;      // Maximum trades per day (recommended: 2-5 for quality)
+input double   MaxDailyLossUSD  = 100.0;  // Stop trading if daily loss exceeds this (USD)
+input double   MaxSingleTradeLossUSD = 50.0; // Alert if single trade loss exceeds this (USD)
 
-input string   SESSION_SETTINGS  = "--- Session Times (UTC) ---";
-input int      LondonStartHour   = 7;
-input int      LondonStartMinute = 0;
-input int      LondonEndHour     = 8;
-input int      LondonEndMinute   = 30;
-input int      NYStartHour       = 12;
-input int      NYStartMinute     = 30;
-input int      NYEndHour         = 14;
-input int      NYEndMinute       = 0;
+//=== BUY TRADE SETTINGS ===
+input group "=== Buy (Long) Trade Settings ===";
+input bool     EnableBuyTrades  = true;   // Enable/Disable buy trades
+input double   BuyLotSize       = 0.10;   // Lot size for buy trades (0 = use default LotSize)
+input bool     UseBuySpecificSL = false;  // Use specific SL for buy trades
+input double   BuyStopLossPips  = 30;     // Stop loss in pips for buy trades
 
-input string   RISK_SETTINGS     = "--- Risk Management ---";
-input int      MaxTradesPerDay = 2; // Max 2 trades per session (London or NY)
-input bool     EnableLossCoolDown = true;
-input int      LossCoolDownMinutes = 15;
+//=== SELL TRADE SETTINGS ===
+input group "=== Sell (Short) Trade Settings ===";
+input bool     EnableSellTrades = true;   // Enable/Disable sell trades
+input double   SellLotSize      = 0.10;   // Lot size for sell trades (0 = use default LotSize)
+input bool     UseSellSpecificSL = false; // Use specific SL for sell trades
+input double   SellStopLossPips  = 30;     // Stop loss in pips for sell trades
 
-input string   LOG_SETTINGS      = "--- Logging ---";
-input bool     EnableDetailedLog = true;
-input bool     EnableEmailAlerts = false;
+//=== TIME & SESSION SETTINGS ===
+input group "=== Trading Time Settings ===";
+input bool     TradeAllDay      = false;  // If true, trade all day (ignore session limits)
+input bool     TradeLondonSession = true; // Trade during London session (07:00-10:00 UTC)
+input int      LondonStartHour   = 7;     // London session start hour (UTC)
+input int      LondonStartMinute = 0;     // London session start minute
+input int      LondonEndHour     = 10;    // London session end hour (UTC) - no entries after this
+input int      TradeMaxDurationHours = 3; // Maximum trade duration (hours) before auto-close
+input bool     NoFridayTrading  = true;   // Disable trading on Fridays
+
+//=== MEAN CALCULATION SETTINGS ===
+input group "=== Mean Calculation Settings ===";
+input MEAN_TYPE MeanMethod       = ASIAN_MIDPOINT; // Mean calculation method
+input bool     UseATRFilter      = true;  // Use ATR-based distance filter
+input int      ATR_Period        = 14;   // ATR period for calculations
+
+//=== ENTRY CONDITIONS ===
+input group "=== Entry Condition Settings ===";
+input bool     RequireExhaustion = false; // Require exhaustion pattern for entry (default: false for more trades)
+input bool     RequireRejection  = false; // Require rejection pattern at key levels (default: false for more trades)
+input bool     RequireVolumeConf = false; // Require volume confirmation
+input int      MinCandleWickPct  = 40;    // Minimum wick % for pin bars (40% = strong rejection)
+
+//=== EXIT & TAKE PROFIT SETTINGS ===
+input group "=== Exit & Take Profit Settings ===";
+input TP_METHOD TakeProfitMethod = TO_MEAN; // Take profit method
+input bool     UseAutoCloseRule  = true;  // Auto-close if trade not moving toward target
+input bool     UseTrailingStop   = true;  // Use trailing stop loss
+input double   TrailingStopPips  = 20;    // Trailing stop distance (pips)
+input double   TrailingActivationPips = 15; // Activate trailing after X pips profit
+
+//=== TELEGRAM ALERT SETTINGS ===
+input group "=== Telegram Alert Settings ===";
+input string   TelegramToken     = "7481766478:AAE9SU9K15g09fTE3iAwQdQWz_5ADyvMoG4";
+input string   ChatID            = "6583697962";
+input bool     EnableTradeEntryAlert = true;  // Alert on trade entry
+input bool     EnableTradeExitAlert = true;  // Alert on trade exit
+input bool     EnableMarginAlert = true;      // Alert if margin exceeds limit
+input bool     EnableLossAlert  = true;       // Alert if single trade loss exceeds limit
+input double   MaxMarginUtilizedUSD = 2000.0; // Alert if margin > this amount (USD)
+input bool     TelegramDebugMode = false;     // If true, log to file instead of sending
+
+//=== LOGGING SETTINGS ===
+input group "=== Logging Settings ===";
+input bool     EnableDetailedLog = true;  // Enable detailed logging
+input bool     EnableEmailAlerts = false;  // Enable email alerts (if supported)
 
 //+------------------------------------------------------------------+
 //| Global Objects                                                   |
@@ -83,6 +124,7 @@ CVWAPMagnetTrade*     g_VWAPMagnetTrade;
 CLiquidityMagnet*      g_LiquidityMagnet;
 CProfessionalTradeManager* g_ProfessionalTradeManager;
 CRejectionDetector*    g_RejectionDetector;
+CTelegramAlert*        g_TelegramAlert;
 
 string g_CurrentSymbol;
 datetime g_LastBarTime = 0;
@@ -138,6 +180,37 @@ ulong GetEAPositionTicket(string symbol)
 }
 
 //+------------------------------------------------------------------+
+//| Get daily loss in USD                                            |
+//+------------------------------------------------------------------+
+double GetDailyLoss()
+{
+   double totalLoss = 0;
+   datetime dayStart = TimeCurrent() - (TimeCurrent() % 86400);
+   
+   HistorySelect(dayStart, TimeCurrent());
+   int total = HistoryDealsTotal();
+   
+   for(int i = 0; i < total; i++)
+   {
+      ulong dealTicket = HistoryDealGetTicket(i);
+      if(dealTicket > 0)
+      {
+         if(HistoryDealGetInteger(dealTicket, DEAL_MAGIC) == EA_MAGIC_NUMBER &&
+            HistoryDealGetString(dealTicket, DEAL_SYMBOL) == g_CurrentSymbol)
+         {
+            double profit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
+            double swap = HistoryDealGetDouble(dealTicket, DEAL_SWAP);
+            double commission = HistoryDealGetDouble(dealTicket, DEAL_COMMISSION);
+            
+            totalLoss += profit + swap + commission;
+         }
+      }
+   }
+   
+   return (totalLoss < 0) ? MathAbs(totalLoss) : 0;
+}
+
+//+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit()
@@ -155,14 +228,15 @@ int OnInit()
    
    // Initialize all manager classes
    g_Logger = new CLogger(EnableDetailedLog, EnableEmailAlerts);
-   g_TimeManager = new CTimeManager(LondonStartHour, LondonStartMinute, LondonEndHour, LondonEndMinute,
-                                    NYStartHour, NYStartMinute, NYEndHour, NYEndMinute, g_Logger);
+   // TimeManager: Use LondonEndHour as end, set NY session to 12:30-14:00 UTC
+   g_TimeManager = new CTimeManager(LondonStartHour, LondonStartMinute, LondonEndHour, 0,
+                                    12, 30, 14, 0, g_Logger);
    g_MeanCalculator = new CMeanCalculator(MeanMethod, g_CurrentSymbol, g_Logger);
    g_ExhaustionDetector = new CExhaustionDetector(g_CurrentSymbol, g_Logger);
    g_RiskManager = new CRiskManager(TakeProfitMethod, UseAutoCloseRule, g_ATRHandle, g_CurrentSymbol, g_Logger);
-   g_SessionManager = new CSessionManager(MaxTradesPerDay, EnableLossCoolDown, LossCoolDownMinutes, g_Logger);
+   g_SessionManager = new CSessionManager(MaxTradesPerDay, false, 0, g_Logger);
    g_ValidationChecker = new CValidationChecker(g_CurrentSymbol, g_ATRHandle, g_Logger);
-   g_TradeExecutor = new CTradeExecutor(LotSize, UseMoneyManagement, RiskPercent, g_CurrentSymbol, g_Logger);
+   g_TradeExecutor = new CTradeExecutor(LotSize, UseMoneyManagement, RiskPercentPerTrade, g_CurrentSymbol, g_Logger);
    g_BuyTrade = new CBuyTrade(g_TradeExecutor, g_RiskManager, g_MeanCalculator, g_ExhaustionDetector,
                               g_ValidationChecker, g_CurrentSymbol, g_ATRHandle, g_Logger);
    g_SellTrade = new CSellTrade(g_TradeExecutor, g_RiskManager, g_MeanCalculator, g_ExhaustionDetector,
@@ -174,6 +248,9 @@ int OnInit()
    g_LiquidityMagnet = new CLiquidityMagnet(g_CurrentSymbol, g_Logger);
    g_ProfessionalTradeManager = new CProfessionalTradeManager(g_CurrentSymbol, g_Logger, g_MeanCalculator);
    g_RejectionDetector = new CRejectionDetector(g_CurrentSymbol, g_Logger);
+   g_TelegramAlert = new CTelegramAlert(TelegramToken, ChatID, EnableTradeEntryAlert, EnableTradeExitAlert,
+                                        EnableMarginAlert, EnableLossAlert, MaxMarginUtilizedUSD, MaxSingleTradeLossUSD,
+                                        TelegramDebugMode, g_Logger);
    
    g_Logger.LogInfo("Mean Reversion EA initialized successfully");
    g_Logger.LogInfo(StringFormat("Symbol: %s, Mean Method: %d, TP Method: %d", 
@@ -212,6 +289,7 @@ void OnDeinit(const int reason)
    if(g_LiquidityMagnet != NULL) delete g_LiquidityMagnet;
    if(g_ProfessionalTradeManager != NULL) delete g_ProfessionalTradeManager;
    if(g_RejectionDetector != NULL) delete g_RejectionDetector;
+   if(g_TelegramAlert != NULL) delete g_TelegramAlert;
    
    Print("Mean Reversion EA deinitialized");
 }
@@ -256,12 +334,19 @@ void OnTick()
       ulong ticket = GetEAPositionTicket(g_CurrentSymbol);
       if(ticket > 0 && PositionSelectByTicket(ticket))
       {
+         // Check for loss alert
+         if(g_TelegramAlert != NULL)
+         {
+            g_TelegramAlert.CheckTradeLoss(ticket, g_CurrentSymbol);
+         }
+         
          g_ProfessionalTradeManager.ManageTrade();
          
          if(g_ProfessionalTradeManager.ShouldExitTrade())
          {
             bool isLong = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
             string exitReason = g_ProfessionalTradeManager.GetExitReason();
+            double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
             
             MqlTradeRequest request = {};
             MqlTradeResult result = {};
@@ -276,6 +361,22 @@ void OnTick()
             if(OrderSend(request, result))
             {
                g_Logger.LogInfo(StringFormat("Trade closed: %s", exitReason));
+               
+               // Send Telegram alert for trade exit
+               if(g_TelegramAlert != NULL)
+               {
+                  double exitPrice = isLong ? SymbolInfoDouble(g_CurrentSymbol, SYMBOL_BID) : SymbolInfoDouble(g_CurrentSymbol, SYMBOL_ASK);
+                  double profit = PositionGetDouble(POSITION_PROFIT);
+                  double point = SymbolInfoDouble(g_CurrentSymbol, SYMBOL_POINT);
+                  int digits = (int)SymbolInfoInteger(g_CurrentSymbol, SYMBOL_DIGITS);
+                  double pipValue = (digits == 3 || digits == 5) ? point * 10 : point;
+                  double profitPips = isLong ? 
+                                     ((exitPrice - entryPrice) / pipValue) : 
+                                     ((entryPrice - exitPrice) / pipValue);
+                  
+                  g_TelegramAlert.AlertTradeExit(isLong, exitPrice, profit, profitPips, g_CurrentSymbol, exitReason);
+                  g_TelegramAlert.CheckMarginUtilization();
+               }
             }
          }
       }
@@ -421,10 +522,45 @@ void OnTick()
    }
    
    // NEW LOGIC: Last Day Mean Reversion (24-hour high/low/mid)
-   // Only trade in London session
-   if(!g_TimeManager.IsLondonSession())
+   // Check trading time settings
+   if(!TradeAllDay)
    {
-      return; // Only trade during London session
+      if(TradeLondonSession && !g_TimeManager.IsLondonSession())
+      {
+         return; // Only trade during London session if enabled
+      }
+      else if(!TradeLondonSession)
+      {
+         return; // No trading sessions enabled
+      }
+   }
+   
+   // Check Friday trading restriction
+   if(NoFridayTrading)
+   {
+      MqlDateTime dt;
+      TimeToStruct(TimeCurrent(), dt);
+      if(dt.day_of_week == 5) // Friday
+      {
+         if(EnableDetailedLog)
+            g_Logger.LogInfo("Trading disabled on Friday");
+         return;
+      }
+   }
+   
+   // Check daily trade limit
+   if(!g_SessionManager.CanTrade())
+   {
+      if(EnableDetailedLog)
+         g_Logger.LogInfo(StringFormat("Daily trade limit reached: %d/%d", 
+                                      g_SessionManager.GetTradesToday(), MaxTradesPerDay));
+      return;
+   }
+   
+   // Check buy/sell trade enable flags
+   if(!EnableBuyTrades && !EnableSellTrades)
+   {
+      return; // Both trade types disabled
    }
    
    // Get current market data
@@ -450,8 +586,35 @@ void OnTick()
       return;
    }
    
+   // Check daily loss limit
+   if(MaxDailyLossUSD > 0 && g_TelegramAlert != NULL)
+   {
+      double dailyLoss = GetDailyLoss();
+      if(dailyLoss >= MaxDailyLossUSD)
+      {
+         if(EnableDetailedLog)
+            g_Logger.LogWarning(StringFormat("Daily loss limit reached: $%.2f (Max: $%.2f) - Trading stopped", 
+                                            dailyLoss, MaxDailyLossUSD));
+         return;
+      }
+   }
+   
+   // Check exhaustion requirement (if enabled)
+   int exhaustionType = g_ExhaustionDetector.DetectExhaustion();
+   bool hasExhaustion = (exhaustionType != EXHAUSTION_NONE);
+   
+   if(RequireExhaustion && !hasExhaustion)
+   {
+      if(EnableDetailedLog)
+         g_Logger.LogWarning("Trade rejected: No exhaustion pattern (RequireExhaustion = true)");
+      return;
+   }
+   
    double point = SymbolInfoDouble(g_CurrentSymbol, SYMBOL_POINT);
-   double tolerance = 15 * point * 10; // 15 pips tolerance for "near" level
+   // Increased tolerance: Use ATR-based or 0.3% of price, whichever is larger (was 15 pips)
+   double atrTolerance = atr[0] * 0.5; // 50% of ATR
+   double percentTolerance = ask * 0.003; // 0.3% of price
+   double tolerance = MathMax(atrTolerance, percentTolerance); // Use larger tolerance
    
    // Determine which level price is near
    bool nearHigh = MathAbs(ask - lastDayHigh) <= tolerance;
@@ -468,7 +631,7 @@ void OnTick()
    if(nearHigh)
    {
       // Check for rejection wick/candle at high
-      if(g_RejectionDetector.DetectRejection(lastDayHigh, false)) // false = short (rejection at high)
+      if((!RequireRejection || g_RejectionDetector.DetectRejection(lastDayHigh, false))) // false = short (rejection at high)
       {
          isShortSetup = true;
          targetMean = lastDayMid; // Target mid
@@ -492,7 +655,7 @@ void OnTick()
    else if(nearLow)
    {
       // Check for rejection wick/candle at low
-      if(g_RejectionDetector.DetectRejection(lastDayLow, true)) // true = long (rejection at low)
+      if((!RequireRejection || g_RejectionDetector.DetectRejection(lastDayLow, true))) // true = long (rejection at low)
       {
          isLongSetup = true;
          targetMean = lastDayMid; // Target mid
@@ -536,7 +699,7 @@ void OnTick()
       else if(midDirection == -1)
       {
          // Going to LOW → LONG from mid
-         if(g_RejectionDetector.DetectRejection(lastDayMid, true))
+         if((!RequireRejection || g_RejectionDetector.DetectRejection(lastDayMid, true)))
          {
             isLongSetup = true;
             targetMean = lastDayLow; // Target low
@@ -667,6 +830,16 @@ void OnTick()
             if(ticket > 0 && PositionSelectByTicket(ticket))
             {
                double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+               double lotSize = PositionGetDouble(POSITION_VOLUME);
+               double stopLoss = PositionGetDouble(POSITION_SL);
+               double takeProfit = PositionGetDouble(POSITION_TP);
+               
+               // Send Telegram alert for trade entry
+               if(g_TelegramAlert != NULL)
+               {
+                  g_TelegramAlert.AlertTradeEntry(true, entryPrice, lotSize, stopLoss, takeProfit, g_CurrentSymbol);
+                  g_TelegramAlert.CheckMarginUtilization();
+               }
                
                // Get London reaction levels (high/low from London session start)
                double londonReactionHigh = 0;
@@ -732,6 +905,9 @@ void OnTick()
             if(ticket == 0 || !PositionSelectByTicket(ticket))
                return;
             double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+            double lotSize = PositionGetDouble(POSITION_VOLUME);
+            double stopLoss = PositionGetDouble(POSITION_SL);
+            double takeProfit = PositionGetDouble(POSITION_TP);
             
             // Get London reaction levels
             double londonReactionHigh = 0;
@@ -755,6 +931,13 @@ void OnTick()
             
             g_ProfessionalTradeManager.InitializeTrade(ticket, false, entryPrice, targetMean, targetVWAP, 
                                                        distanceFromMean, londonReactionHigh, londonReactionLow);
+            
+            // Send Telegram alert for trade entry
+            if(g_TelegramAlert != NULL)
+            {
+               g_TelegramAlert.AlertTradeEntry(false, entryPrice, lotSize, stopLoss, takeProfit, g_CurrentSymbol);
+               g_TelegramAlert.CheckMarginUtilization();
+            }
          }
          
          // Set multiple TP targets if enabled (using last day levels)
