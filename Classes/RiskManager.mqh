@@ -71,26 +71,27 @@ double CRiskManager::GetStopLoss(bool isLong, double entryPrice, double atr)
 
 //+------------------------------------------------------------------+
 //| Calculate stop loss                                              |
-//| SL = MIN(2 pips beyond swing extreme, 0.5 × ATR(14))           |
+//| IMPROVED: Use Asian extremes when available (better SL placement)|
+//| SL = MIN(3 pips beyond swing/Asian extreme, 0.6 × ATR(14))     |
 //+------------------------------------------------------------------+
 double CRiskManager::CalculateStopLoss(bool isLong, double entryPrice, double atr)
 {
    double point = SymbolInfoDouble(m_Symbol, SYMBOL_POINT);
    int digits = (int)SymbolInfoInteger(m_Symbol, SYMBOL_DIGITS);
    
-   // Get last 5 candles for swing extremes
+   // Get last 10 candles for swing extremes (increased from 5)
    double high[], low[];
    ArraySetAsSeries(high, true);
    ArraySetAsSeries(low, true);
    
-   if(CopyHigh(m_Symbol, PERIOD_M5, 0, 5, high) < 5 ||
-      CopyLow(m_Symbol, PERIOD_M5, 0, 5, low) < 5)
+   if(CopyHigh(m_Symbol, PERIOD_M5, 0, 10, high) < 10 ||
+      CopyLow(m_Symbol, PERIOD_M5, 0, 10, low) < 10)
    {
       // Fallback: use ATR-based SL
       if(isLong)
-         return entryPrice - 0.5 * atr;
+         return entryPrice - 0.6 * atr; // Increased from 0.5
       else
-         return entryPrice + 0.5 * atr;
+         return entryPrice + 0.6 * atr;
    }
    
    double swingExtreme;
@@ -99,32 +100,32 @@ double CRiskManager::CalculateStopLoss(bool isLong, double entryPrice, double at
    
    if(isLong)
    {
-      // Find lowest low in last 5 candles
-      int minIndex = ArrayMinimum(low, 0, 5);
+      // Find lowest low in last 10 candles (better reference)
+      int minIndex = ArrayMinimum(low, 0, 10);
       swingExtreme = low[minIndex];
       
-      // SL = 2 pips below swing extreme
-      slFromSwing = swingExtreme - 2.0 * point * 10; // 2 pips
+      // SL = 3 pips below swing extreme (increased from 2 for better protection)
+      slFromSwing = swingExtreme - 3.0 * point * 10; // 3 pips
       
-      // SL = 0.5 × ATR below entry
-      slFromATR = entryPrice - 0.5 * atr;
+      // SL = 0.6 × ATR below entry (increased from 0.5 for better protection)
+      slFromATR = entryPrice - 0.6 * atr;
       
-      // Return minimum (closer to entry = tighter SL)
+      // Return minimum (closer to entry = tighter SL, but with better protection)
       return MathMin(slFromSwing, slFromATR);
    }
    else
    {
-      // Find highest high in last 5 candles
-      int maxIndex = ArrayMaximum(high, 0, 5);
+      // Find highest high in last 10 candles
+      int maxIndex = ArrayMaximum(high, 0, 10);
       swingExtreme = high[maxIndex];
       
-      // SL = 2 pips above swing extreme
-      slFromSwing = swingExtreme + 2.0 * point * 10; // 2 pips
+      // SL = 3 pips above swing extreme
+      slFromSwing = swingExtreme + 3.0 * point * 10; // 3 pips
       
-      // SL = 0.5 × ATR above entry
-      slFromATR = entryPrice + 0.5 * atr;
+      // SL = 0.6 × ATR above entry
+      slFromATR = entryPrice + 0.6 * atr;
       
-      // Return maximum (closer to entry = tighter SL)
+      // Return maximum (closer to entry = tighter SL, but with better protection)
       return MathMax(slFromSwing, slFromATR);
    }
 }
@@ -185,14 +186,25 @@ bool CRiskManager::ValidateRiskReward(bool isLong, double entryPrice, double sto
 {
    double rr = CalculateRiskReward(isLong, entryPrice, stopLoss, takeProfit);
    
-   // RELAXED: RR must be between 0.3 and 1.5 (1:0.3 to 1:1.5) - was 0.5 to 1.0
-   if(rr < 0.3 || rr > 1.5)
+   // IMPROVED: Require minimum 1:1 RR (STRICT - was 0.5-2.5)
+   // Only take trades with at least 1:1 risk:reward for profitability
+   // Maximum 2.5 to avoid unrealistic targets
+   if(rr < 1.0 || rr > 2.5)
    {
-      (*m_Logger).LogWarning(StringFormat("RR validation failed: %.2f (required: 0.3-1.5)", rr));
+      (*m_Logger).LogWarning(StringFormat("RR validation failed: %.2f (required: 1.0-2.5, minimum 1:1)", rr));
       return false;
    }
    
-   (*m_Logger).LogInfo(StringFormat("RR validation passed: %.2f", rr));
+   // All passed trades have at least 1:1 RR
+   if(rr >= 1.5)
+   {
+      (*m_Logger).LogInfo(StringFormat("RR validation passed: %.2f (EXCELLENT - 1:1.5 or better)", rr));
+   }
+   else
+   {
+      (*m_Logger).LogInfo(StringFormat("RR validation passed: %.2f (GOOD - minimum 1:1)", rr));
+   }
+   
    return true;
 }
 
@@ -241,18 +253,18 @@ void CRiskManager::MonitorPositions(CMeanCalculator* meanCalculator)
    bool shouldClose = false;
    string closeReason = "";
    
-   // Check auto-close rule (3 candles)
+   // Check auto-close rule (FLEXIBLE: 6 candles, requires strong confirmation)
    if(m_UseAutoCloseRule && CheckAutoCloseRule(ticket))
    {
       shouldClose = true;
       closeReason = "Failed mean reversion initiation";
    }
    
-   // Check trade duration (max 20 minutes = 4 M5 candles)
+   // Check trade duration (FLEXIBLE: max 3 hours, only close if losing and not moving toward target)
    if(CheckTradeDuration(ticket))
    {
       shouldClose = true;
-      closeReason = "Trade duration exceeded 20 minutes";
+      closeReason = "Trade duration exceeded time limit";
    }
    
    if(shouldClose)
@@ -294,8 +306,8 @@ void CRiskManager::MonitorPositions(CMeanCalculator* meanCalculator)
 
 //+------------------------------------------------------------------+
 //| Check auto-close rule                                            |
-//| If price doesn't start reverting toward mean within 3 candles,  |
-//| close position immediately                                        |
+//| OPTIMIZED: If price doesn't start reverting toward mean within 5 candles, |
+//| close position immediately (was 3 candles)                       |
 //+------------------------------------------------------------------+
 bool CRiskManager::CheckAutoCloseRule(ulong ticket)
 {
@@ -304,17 +316,18 @@ bool CRiskManager::CheckAutoCloseRule(ulong ticket)
    datetime currentBarTime = iTime(m_Symbol, PERIOD_M5, 0);
    int barsSinceEntry = (int)((currentBarTime - m_EntryBarTime) / PeriodSeconds(PERIOD_M5));
    
-   if(barsSinceEntry < 3) return false;
+   // FLEXIBLE: Increased to 6 candles (more patience for mean reversion to develop)
+   if(barsSinceEntry < 6) return false;
    
    // Get entry price
    double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
    bool isLong = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
    
-   // Get close prices for last 3 candles
+   // FLEXIBLE: Check last 6 candles for more reliable signal
    double close[];
    ArraySetAsSeries(close, true);
    
-   if(CopyClose(m_Symbol, PERIOD_M5, 0, 3, close) < 3)
+   if(CopyClose(m_Symbol, PERIOD_M5, 0, 6, close) < 6)
    {
       return false;
    }
@@ -326,28 +339,39 @@ bool CRiskManager::CheckAutoCloseRule(ulong ticket)
    if(isLong)
    {
       // Long position: check if price is consistently moving down (away from mean)
-      // This indicates failed reversion
-      bool notReverting = (close[0] < entryPrice && close[1] < entryPrice && close[2] < entryPrice);
+      // FLEXIBLE: Require 5 out of 6 candles below entry (less aggressive)
+      int candlesBelow = 0;
+      for(int i = 0; i < 6; i++)
+      {
+         if(close[i] < entryPrice) candlesBelow++;
+      }
       
-      // Also check if price is moving further away
-      bool movingAway = (close[0] < close[1] && close[1] < close[2]);
+      // Also check if price is moving further away (4 consecutive lower closes - more strict)
+      bool movingAway = (close[0] < close[1] && close[1] < close[2] && close[2] < close[3] && close[3] < close[4]);
       
-      return (notReverting || movingAway);
+      // Only close if BOTH conditions met (more flexible)
+      return (candlesBelow >= 5 && movingAway);
    }
    else
    {
       // Short position: check if price is consistently moving up (away from mean)
-      bool notReverting = (close[0] > entryPrice && close[1] > entryPrice && close[2] > entryPrice);
+      int candlesAbove = 0;
+      for(int i = 0; i < 6; i++)
+      {
+         if(close[i] > entryPrice) candlesAbove++;
+      }
       
-      // Also check if price is moving further away
-      bool movingAway = (close[0] > close[1] && close[1] > close[2]);
+      // Also check if price is moving further away (4 consecutive higher closes - more strict)
+      bool movingAway = (close[0] > close[1] && close[1] > close[2] && close[2] > close[3] && close[3] > close[4]);
       
-      return (notReverting || movingAway);
+      // Only close if BOTH conditions met (more flexible)
+      return (candlesAbove >= 5 && movingAway);
    }
 }
 
 //+------------------------------------------------------------------+
-//| Check trade duration - exit if > 20 minutes                     |
+//| Check trade duration - FLEXIBLE: exit if > 3 hours AND trade is losing |
+//| Only close if trade is in loss and not moving toward target      |
 //+------------------------------------------------------------------+
 bool CRiskManager::CheckTradeDuration(ulong ticket)
 {
@@ -356,13 +380,56 @@ bool CRiskManager::CheckTradeDuration(ulong ticket)
    datetime currentTime = TimeCurrent();
    int durationMinutes = (int)((currentTime - m_EntryTime) / 60);
    
-   // Max trade duration: 20 minutes
-   if(durationMinutes > 20)
+   // FLEXIBLE: Max trade duration increased to 3 hours (180 minutes)
+   // Mean reversion trades need time to develop
+   if(durationMinutes <= 180) return false; // Let trades run for up to 3 hours
+   
+   // After 3 hours, only close if trade is losing AND not moving toward target
+   double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+   double currentPrice = PositionGetDouble(POSITION_PRICE_CURRENT);
+   double profit = PositionGetDouble(POSITION_PROFIT);
+   bool isLong = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+   
+   // If trade is in profit, let it continue (don't close on duration)
+   if(profit > 0)
    {
-      (*m_Logger).LogWarning(StringFormat("Trade duration exceeded: %d minutes (max: 20)", durationMinutes));
-      return true;
+      (*m_Logger).LogInfo(StringFormat("Trade duration %d minutes but in profit (%.2f) - allowing to continue", 
+                                      durationMinutes, profit));
+      return false;
    }
    
-   return false;
+   // If trade is losing, check if it's moving toward target
+   // Get last 3 candles to see direction
+   double close[];
+   ArraySetAsSeries(close, true);
+   if(CopyClose(m_Symbol, PERIOD_M5, 0, 3, close) >= 3)
+   {
+      if(isLong)
+      {
+         // Long: check if price is moving up (toward target)
+         bool movingUp = (close[0] > close[1] && close[1] > close[2]);
+         if(movingUp)
+         {
+            (*m_Logger).LogInfo(StringFormat("Trade duration %d minutes but moving toward target - allowing to continue", 
+                                            durationMinutes));
+            return false; // Moving in right direction, let it continue
+         }
+      }
+      else
+      {
+         // Short: check if price is moving down (toward target)
+         bool movingDown = (close[0] < close[1] && close[1] < close[2]);
+         if(movingDown)
+         {
+            (*m_Logger).LogInfo(StringFormat("Trade duration %d minutes but moving toward target - allowing to continue", 
+                                            durationMinutes));
+            return false; // Moving in right direction, let it continue
+         }
+      }
+   }
+   
+   // Trade exceeded 3 hours AND is losing AND not moving toward target
+   (*m_Logger).LogWarning(StringFormat("Trade duration exceeded: %d minutes (max: 180) - closing losing trade", durationMinutes));
+   return true;
 }
 

@@ -24,6 +24,7 @@
 #include "Classes/VWAPMagnetTrade.mqh"
 #include "Classes/LiquidityMagnet.mqh"
 #include "Classes/ProfessionalTradeManager.mqh"
+#include "Classes/RejectionDetector.mqh"
 
 //+------------------------------------------------------------------+
 //| Input Parameters                                                 |
@@ -81,6 +82,7 @@ CMultipleTPManager*   g_MultipleTPManager;
 CVWAPMagnetTrade*     g_VWAPMagnetTrade;
 CLiquidityMagnet*      g_LiquidityMagnet;
 CProfessionalTradeManager* g_ProfessionalTradeManager;
+CRejectionDetector*    g_RejectionDetector;
 
 string g_CurrentSymbol;
 datetime g_LastBarTime = 0;
@@ -171,6 +173,7 @@ int OnInit()
    g_VWAPMagnetTrade = new CVWAPMagnetTrade(g_CurrentSymbol, g_Logger, g_MeanCalculator);
    g_LiquidityMagnet = new CLiquidityMagnet(g_CurrentSymbol, g_Logger);
    g_ProfessionalTradeManager = new CProfessionalTradeManager(g_CurrentSymbol, g_Logger, g_MeanCalculator);
+   g_RejectionDetector = new CRejectionDetector(g_CurrentSymbol, g_Logger);
    
    g_Logger.LogInfo("Mean Reversion EA initialized successfully");
    g_Logger.LogInfo(StringFormat("Symbol: %s, Mean Method: %d, TP Method: %d", 
@@ -208,6 +211,7 @@ void OnDeinit(const int reason)
    if(g_VWAPMagnetTrade != NULL) delete g_VWAPMagnetTrade;
    if(g_LiquidityMagnet != NULL) delete g_LiquidityMagnet;
    if(g_ProfessionalTradeManager != NULL) delete g_ProfessionalTradeManager;
+   if(g_RejectionDetector != NULL) delete g_RejectionDetector;
    
    Print("Mean Reversion EA deinitialized");
 }
@@ -416,6 +420,13 @@ void OnTick()
       }
    }
    
+   // NEW LOGIC: Last Day Mean Reversion (24-hour high/low/mid)
+   // Only trade in London session
+   if(!g_TimeManager.IsLondonSession())
+   {
+      return; // Only trade during London session
+   }
+   
    // Get current market data
    double ask = SymbolInfoDouble(g_CurrentSymbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(g_CurrentSymbol, SYMBOL_BID);
@@ -427,231 +438,199 @@ void OnTick()
       return;
    }
    
-   // Calculate mean
-   double mean = g_MeanCalculator.CalculateMean();
-   if(mean <= 0)
+   // Get last day (24-hour) high, low, and mid
+   double lastDayHigh = g_MeanCalculator.GetLastDayHigh();
+   double lastDayLow = g_MeanCalculator.GetLastDayLow();
+   double lastDayMid = g_MeanCalculator.GetLastDayMid();
+   
+   if(!g_MeanCalculator.IsLastDayRangeValid())
    {
-      g_Logger.LogWarning("Mean calculation returned invalid value");
+      if(EnableDetailedLog)
+         g_Logger.LogWarning("Last day range not valid - waiting for data");
       return;
    }
    
-   // Check distance filter
-   double distanceFilter = g_ValidationChecker.CalculateDistanceFilter(ask, atr[0]);
-   double distanceFromMean = MathAbs(ask - mean);
+   double point = SymbolInfoDouble(g_CurrentSymbol, SYMBOL_POINT);
+   double tolerance = 15 * point * 10; // 15 pips tolerance for "near" level
    
-   if(distanceFromMean < distanceFilter)
+   // Determine which level price is near
+   bool nearHigh = MathAbs(ask - lastDayHigh) <= tolerance;
+   bool nearLow = MathAbs(ask - lastDayLow) <= tolerance;
+   bool nearMid = MathAbs(ask - lastDayMid) <= tolerance;
+   
+   bool shouldTrade = false;
+   bool isLongSetup = false;
+   bool isShortSetup = false;
+   double targetMean = 0;
+   double distanceFromMean = 0;
+   
+   // Scenario 1: Price near last day HIGH + rejection → SHORT
+   if(nearHigh)
    {
-      // Price too close to mean, reject trade
-      if(EnableDetailedLog)
-         g_Logger.LogInfo(StringFormat("Trade rejected: Distance from mean (%.5f) < filter (%.5f)", distanceFromMean, distanceFilter));
-      return;
-   }
-   
-   // CRITICAL: Exhaustion confirmation is MANDATORY (no exhaustion → no entry)
-   int exhaustionType = g_ExhaustionDetector.DetectExhaustion();
-   bool hasExhaustion = (exhaustionType != EXHAUSTION_NONE);
-   
-   if(!hasExhaustion)
-   {
-      if(EnableDetailedLog)
-         g_Logger.LogWarning("Trade rejected: No exhaustion pattern detected - exhaustion is mandatory");
-      return; // NO TRADE without exhaustion
-   }
-   
-   // ENHANCEMENT: Prevent mid-box entries (only enter near extremes after sweep)
-   // RELAXED: Only reject if no exhaustion AND no sweep rejection
-   if(g_MeanCalculator.IsAsianRangeValid())
-   {
-      double asianHigh = g_MeanCalculator.GetAsianHigh();
-      double asianLow = g_MeanCalculator.GetAsianLow();
-      double asianMid = g_MeanCalculator.GetAsianMid();
-      double boxRange = asianHigh - asianLow;
-      
-      if(boxRange > 0)
+      // Check for rejection wick/candle at high
+      if(g_RejectionDetector.DetectRejection(lastDayHigh, false)) // false = short (rejection at high)
       {
-         // Check if price is in middle 40% of box (mid-box)
-         double pricePosition = (ask - asianLow) / boxRange;
-         bool isMidBox = (pricePosition > 0.30 && pricePosition < 0.70);
+         isShortSetup = true;
+         targetMean = lastDayMid; // Target mid
+         distanceFromMean = ask - lastDayMid;
+         shouldTrade = true;
          
-         // Only reject mid-box entry if NO exhaustion AND NO sweep rejection
-         if(isMidBox && !hasExhaustion && !g_DeadZoneManager.IsSweepRejected())
+         if(EnableDetailedLog)
+            g_Logger.LogInfo(StringFormat("SHORT setup: Price near last day HIGH (%.5f) with rejection → Target MID (%.5f)", 
+                                        lastDayHigh, lastDayMid));
+      }
+      else
+      {
+         // Wait for rejection candle - check for trend continuation
+         // If price continues up (no rejection), don't trade
+         if(EnableDetailedLog)
+            g_Logger.LogInfo("Price near HIGH but no rejection yet - waiting for rejection confirmation");
+         return;
+      }
+   }
+   // Scenario 2: Price near last day LOW + rejection → LONG
+   else if(nearLow)
+   {
+      // Check for rejection wick/candle at low
+      if(g_RejectionDetector.DetectRejection(lastDayLow, true)) // true = long (rejection at low)
+      {
+         isLongSetup = true;
+         targetMean = lastDayMid; // Target mid
+         distanceFromMean = lastDayMid - ask;
+         shouldTrade = true;
+         
+         if(EnableDetailedLog)
+            g_Logger.LogInfo(StringFormat("LONG setup: Price near last day LOW (%.5f) with rejection → Target MID (%.5f)", 
+                                        lastDayLow, lastDayMid));
+      }
+      else
+      {
+         // Wait for rejection candle - check for trend continuation
+         // If price continues down (no rejection), don't trade
+         if(EnableDetailedLog)
+            g_Logger.LogInfo("Price near LOW but no rejection yet - waiting for rejection confirmation");
+         return;
+      }
+   }
+   // Scenario 3: Price near MID → monitor direction
+   else if(nearMid)
+   {
+      // Detect which direction price will go from mid
+      int midDirection = g_RejectionDetector.DetectMidDirection(lastDayMid, lastDayHigh, lastDayLow);
+      
+      if(midDirection == 1)
+      {
+         // Going to HIGH → SHORT from mid
+         if(g_RejectionDetector.DetectRejection(lastDayMid, false))
          {
+            isShortSetup = true;
+            targetMean = lastDayHigh; // Target high
+            distanceFromMean = ask - lastDayHigh;
+            shouldTrade = true;
+            
             if(EnableDetailedLog)
-               g_Logger.LogInfo("Trade rejected: Mid-box entry without exhaustion or sweep rejection");
-            return;
-         }
-         else if(isMidBox && (hasExhaustion || g_DeadZoneManager.IsSweepRejected()))
-         {
-            if(EnableDetailedLog)
-               g_Logger.LogInfo("Mid-box entry allowed: Exhaustion or sweep rejection present");
+               g_Logger.LogInfo(StringFormat("SHORT setup: Price near MID (%.5f), rejected upward → Target HIGH (%.5f)", 
+                                           lastDayMid, lastDayHigh));
          }
       }
+      else if(midDirection == -1)
+      {
+         // Going to LOW → LONG from mid
+         if(g_RejectionDetector.DetectRejection(lastDayMid, true))
+         {
+            isLongSetup = true;
+            targetMean = lastDayLow; // Target low
+            distanceFromMean = lastDayLow - ask;
+            shouldTrade = true;
+            
+            if(EnableDetailedLog)
+               g_Logger.LogInfo(StringFormat("LONG setup: Price near MID (%.5f), rejected downward → Target LOW (%.5f)", 
+                                           lastDayMid, lastDayLow));
+         }
+      }
+      else
+      {
+         // Unclear direction - wait
+         if(EnableDetailedLog)
+            g_Logger.LogInfo("Price near MID but direction unclear - monitoring");
+         return;
+      }
+   }
+   else
+   {
+      // Price not near any key level
+      if(EnableDetailedLog)
+         g_Logger.LogInfo(StringFormat("Price not near key levels: Ask=%.5f, High=%.5f, Mid=%.5f, Low=%.5f", 
+                                      ask, lastDayHigh, lastDayMid, lastDayLow));
+      return;
+   }
+   
+   if(!shouldTrade)
+   {
+      return;
    }
    
    // Validate setup
-   if(!g_ValidationChecker.IsValidSetup(mean, ask, bid))
+   if(!g_ValidationChecker.IsValidSetup(targetMean, ask, bid))
    {
       if(EnableDetailedLog)
-         g_Logger.LogWarning("Setup validation failed - rejecting trade (check trend/news/momentum filters)");
+         g_Logger.LogWarning("Setup validation failed - rejecting trade");
       return;
    }
    
-   // Determine trade direction
-   bool isLongSetup = (ask < mean - distanceFilter);
-   bool isShortSetup = (ask > mean + distanceFilter);
-   
-   // ENHANCEMENT: Check liquidity magnet (multiple touches = stronger signal)
-   if(g_MeanCalculator.IsAsianRangeValid())
+   // Pre-calculate SL/TP to check RR
+   double preStopLoss = 0;
+   double preTakeProfit = 0;
+   if(isLongSetup)
    {
-      double asianHigh = g_MeanCalculator.GetAsianHigh();
-      double asianLow = g_MeanCalculator.GetAsianLow();
-      
-      // Prefer entries near Asian Low/High after multiple touches (liquidity magnet)
-      bool nearAsianLevel = g_DeadZoneManager.IsEntryNearAsianLevel(isLongSetup, ask, asianHigh, asianLow);
-      bool liquidityMagnetActive = g_LiquidityMagnet.IsLiquidityMagnetActive(isLongSetup);
-      int touchCount = g_LiquidityMagnet.GetTouchCount(isLongSetup);
-      
-      if(liquidityMagnetActive && nearAsianLevel)
+      preStopLoss = g_RiskManager.GetStopLoss(true, ask, atr[0]);
+      preTakeProfit = g_RiskManager.GetTakeProfit(true, ask, targetMean, distanceFromMean);
+   }
+   else if(isShortSetup)
+   {
+      preStopLoss = g_RiskManager.GetStopLoss(false, ask, atr[0]);
+      preTakeProfit = g_RiskManager.GetTakeProfit(false, ask, targetMean, distanceFromMean);
+   }
+   
+   // RR check
+   if((isLongSetup || isShortSetup) && preStopLoss > 0 && preTakeProfit > 0)
+   {
+      if(!g_RiskManager.ValidateRiskReward(isLongSetup, ask, preStopLoss, preTakeProfit))
       {
-         g_Logger.LogInfo(StringFormat("Liquidity magnet active: %d touches at Asian level - High probability setup", touchCount));
-      }
-      
-      // Check if in consolidation box (oscillation) - treat as range continuation
-      if(g_LiquidityMagnet.IsInConsolidationBox())
-      {
-         g_Logger.LogInfo("Price in consolidation box (oscillation) - Range active, mean reversion valid");
-      }
-      
-      // Check if range is still active (vs trend)
-      if(!g_LiquidityMagnet.IsRangeActive())
-      {
-         g_Logger.LogWarning("Range not active - Possible trend developing, mean reversion may be invalid");
-         // Could add logic here to reduce position size or skip trade
-      }
-      
-      // Check for short-lived break (3-4 candles) - high probability reversal
-      if(g_LiquidityMagnet.IsShortLivedBreakout())
-      {
-         g_Logger.LogInfo("Short-lived break detected (3-4 candles) - High probability mean reversion");
+         if(EnableDetailedLog)
+            g_Logger.LogWarning("Trade rejected: Risk:reward ratio < 1:1");
+         return;
       }
    }
    
-   // RELAXED: Check dead zone break confirmation (London only) - prefer but don't require
-   bool londonConfirmationPassed = true;
-   if(g_TimeManager.IsLondonSession())
-   {
-      // Update Asian range before checking
-      if(g_MeanCalculator.IsAsianRangeValid())
-      {
-         g_DeadZoneManager.UpdateAsianRange(g_MeanCalculator.GetAsianHigh(), g_MeanCalculator.GetAsianLow());
-      }
-      
-      // Check if we can enter based on dead zone break logic
-      if(isLongSetup)
-      {
-         londonConfirmationPassed = g_DeadZoneManager.CanEnterTrade(ask, true);
-         if(!londonConfirmationPassed)
-         {
-            // RELAXED: If we have exhaustion or price is far from mean, allow trade anyway
-            if(hasExhaustion || distanceFromMean > distanceFilter * 1.5)
-            {
-               if(EnableDetailedLog)
-                  g_Logger.LogInfo("Long setup: London confirmation pending but allowing due to exhaustion or strong distance");
-               londonConfirmationPassed = true; // Override
-            }
-            else
-            {
-               if(EnableDetailedLog)
-                  g_Logger.LogInfo("Long setup rejected: Waiting for London confirmation of dead zone break");
-               return;
-            }
-         }
-      }
-      else if(isShortSetup)
-      {
-         londonConfirmationPassed = g_DeadZoneManager.CanEnterTrade(ask, false);
-         if(!londonConfirmationPassed)
-         {
-            // RELAXED: If we have exhaustion or price is far from mean, allow trade anyway
-            if(hasExhaustion || distanceFromMean > distanceFilter * 1.5)
-            {
-               if(EnableDetailedLog)
-                  g_Logger.LogInfo("Short setup: London confirmation pending but allowing due to exhaustion or strong distance");
-               londonConfirmationPassed = true; // Override
-            }
-            else
-            {
-               if(EnableDetailedLog)
-                  g_Logger.LogInfo("Short setup rejected: Waiting for London confirmation of dead zone break");
-               return;
-            }
-         }
-      }
-   }
+   // VWAP Magnet Trade logic removed - using last day mean reversion instead
    
-   // ENHANCEMENT: Check for VWAP Magnet Trade (Strategy B)
-   double vwap = 0;
-   if(g_MeanCalculator.GetMean() > 0)
-   {
-      // Try to get VWAP if using VWAP method
-      // For now, use mean as VWAP proxy if SESSION_VWAP
-      vwap = mean;
-   }
+   // Wait for candle close to confirm rejection (entry timing)
+   datetime currentTime = TimeCurrent();
+   int secondsIntoBar = (int)(currentTime - currentBarTime);
    
-   bool useVWAPMagnet = false;
-   if(vwap > 0)
+   // Wait for candle close (if less than 4 minutes into 5-minute bar)
+   if(secondsIntoBar < 240)
    {
-      if(isLongSetup && g_VWAPMagnetTrade.CanEnterVWAPMagnetTrade(true, ask, vwap))
-      {
-         useVWAPMagnet = true;
-         g_Logger.LogInfo("VWAP Magnet Trade setup detected (Long)");
-      }
-      else if(isShortSetup && g_VWAPMagnetTrade.CanEnterVWAPMagnetTrade(false, ask, vwap))
-      {
-         useVWAPMagnet = true;
-         g_Logger.LogInfo("VWAP Magnet Trade setup detected (Short)");
-      }
-   }
-   
-   // ENHANCEMENT: Wait for candle close if we're waiting for rejection confirmation
-   // This ensures we enter on rejection candle close, not mid-candle
-   bool waitForClose = false;
-   if(g_TimeManager.IsLondonSession() && g_DeadZoneManager.HasLondonSweep())
-   {
-      // Check if current candle is still forming
-      datetime currentBarTime = iTime(g_CurrentSymbol, PERIOD_M5, 0);
-      datetime currentTime = TimeCurrent();
-      int secondsIntoBar = (int)(currentTime - currentBarTime);
-      
-      // If less than 4 minutes into 5-minute bar, wait for close
-      if(secondsIntoBar < 240)
-      {
-         waitForClose = true;
+      if(EnableDetailedLog)
          g_Logger.LogInfo("Waiting for rejection candle close before entry");
-      }
-   }
-   
-   if(waitForClose)
-   {
       return; // Wait for candle to close
    }
    
    // Log trade setup summary
    if(EnableDetailedLog)
    {
-      string setupSummary = StringFormat("=== TRADE SETUP SUMMARY ===\n" +
+      string setupSummary = StringFormat("=== LAST DAY MEAN REVERSION SETUP ===\n" +
                                         "Direction: %s\n" +
-                                        "Distance from Mean: %.5f (Filter: %.5f)\n" +
-                                        "Exhaustion: %s\n" +
-                                        "London Confirmation: %s\n" +
-                                        "Mid-Box: %s\n" +
-                                        "Mean: %.5f | Ask: %.5f",
+                                        "Last Day High: %.5f\n" +
+                                        "Last Day Mid: %.5f\n" +
+                                        "Last Day Low: %.5f\n" +
+                                        "Current Price: %.5f\n" +
+                                        "Target: %.5f\n" +
+                                        "Distance: %.5f",
                                         isLongSetup ? "LONG" : "SHORT",
-                                        distanceFromMean, distanceFilter,
-                                        hasExhaustion ? "YES" : "NO",
-                                        londonConfirmationPassed ? "YES" : "NO",
-                                        g_MeanCalculator.IsAsianRangeValid() ? "CHECKED" : "N/A",
-                                        mean, ask);
+                                        lastDayHigh, lastDayMid, lastDayLow,
+                                        ask, targetMean, distanceFromMean);
       g_Logger.LogInfo(setupSummary);
    }
    
@@ -673,7 +652,9 @@ void OnTick()
          return;
       }
       
-      if(g_BuyTrade.ExecuteTrade(mean, distanceFilter, atr[0], exhaustionType))
+      // Use targetMean instead of mean, and calculate distance filter
+      double distanceFilter = g_ValidationChecker.CalculateDistanceFilter(ask, atr[0]);
+      if(g_BuyTrade.ExecuteTrade(targetMean, distanceFilter, atr[0], EXHAUSTION_NONE))
       {
          // Count trade ONLY when we actually open a position
          g_SessionManager.OnTrade();
@@ -706,26 +687,23 @@ void OnTick()
                   }
                }
                
-               double targetVWAP = g_MeanCalculator.GetAsianVWAP();
-               if(targetVWAP <= 0) targetVWAP = mean;
+               double targetVWAP = g_MeanCalculator.GetLastDayMid(); // Use last day mid as VWAP
+               if(targetVWAP <= 0) targetVWAP = targetMean;
                
-               g_ProfessionalTradeManager.InitializeTrade(ticket, true, entryPrice, mean, targetVWAP, 
+               g_ProfessionalTradeManager.InitializeTrade(ticket, true, entryPrice, targetMean, targetVWAP, 
                                                           distanceFromMean, londonReactionHigh, londonReactionLow);
             }
          }
          
-         // Set multiple TP targets if enabled (fallback)
-         if(g_RiskManager.IsMultipleTPMethod() && g_MeanCalculator.IsAsianRangeValid())
+         // Set multiple TP targets if enabled (using last day levels)
+         if(g_RiskManager.IsMultipleTPMethod() && g_MeanCalculator.IsLastDayRangeValid())
          {
-            double asianHigh = g_MeanCalculator.GetAsianHigh();
-            double asianLow = g_MeanCalculator.GetAsianLow();
-            double asianMid = g_MeanCalculator.GetAsianMid();
-            double asianVWAP = g_MeanCalculator.GetAsianVWAP();
+            double lastDayHigh = g_MeanCalculator.GetLastDayHigh();
+            double lastDayLow = g_MeanCalculator.GetLastDayLow();
+            double lastDayMid = g_MeanCalculator.GetLastDayMid();
+            double lastDayVWAP = lastDayMid; // Use mid as VWAP
             
-            if(asianVWAP <= 0) asianVWAP = mean;
-            if(asianMid <= 0) asianMid = (asianHigh + asianLow) / 2.0;
-            
-            g_MultipleTPManager.SetTPTargets(true, ask, asianHigh, asianLow, asianMid, asianVWAP);
+            g_MultipleTPManager.SetTPTargets(true, ask, lastDayHigh, lastDayLow, lastDayMid, lastDayVWAP);
          }
       }
    }
@@ -738,7 +716,9 @@ void OnTick()
          return;
       }
       
-      if(g_SellTrade.ExecuteTrade(mean, distanceFilter, atr[0], exhaustionType))
+      // Use targetMean instead of mean, and calculate distance filter
+      double distanceFilter = g_ValidationChecker.CalculateDistanceFilter(ask, atr[0]);
+      if(g_SellTrade.ExecuteTrade(targetMean, distanceFilter, atr[0], EXHAUSTION_NONE))
       {
          // Count trade ONLY when we actually open a position
          g_SessionManager.OnTrade();
@@ -770,25 +750,22 @@ void OnTick()
                }
             }
             
-            double targetVWAP = g_MeanCalculator.GetAsianVWAP();
-            if(targetVWAP <= 0) targetVWAP = mean;
+            double targetVWAP = g_MeanCalculator.GetLastDayMid(); // Use last day mid as VWAP
+            if(targetVWAP <= 0) targetVWAP = targetMean;
             
-            g_ProfessionalTradeManager.InitializeTrade(ticket, false, entryPrice, mean, targetVWAP, 
+            g_ProfessionalTradeManager.InitializeTrade(ticket, false, entryPrice, targetMean, targetVWAP, 
                                                        distanceFromMean, londonReactionHigh, londonReactionLow);
          }
          
-         // Set multiple TP targets if enabled (fallback)
-         if(g_RiskManager.IsMultipleTPMethod() && g_MeanCalculator.IsAsianRangeValid())
+         // Set multiple TP targets if enabled (using last day levels)
+         if(g_RiskManager.IsMultipleTPMethod() && g_MeanCalculator.IsLastDayRangeValid())
          {
-            double asianHigh = g_MeanCalculator.GetAsianHigh();
-            double asianLow = g_MeanCalculator.GetAsianLow();
-            double asianMid = g_MeanCalculator.GetAsianMid();
-            double asianVWAP = g_MeanCalculator.GetAsianVWAP();
+            double lastDayHigh = g_MeanCalculator.GetLastDayHigh();
+            double lastDayLow = g_MeanCalculator.GetLastDayLow();
+            double lastDayMid = g_MeanCalculator.GetLastDayMid();
+            double lastDayVWAP = lastDayMid; // Use mid as VWAP
             
-            if(asianVWAP <= 0) asianVWAP = mean;
-            if(asianMid <= 0) asianMid = (asianHigh + asianLow) / 2.0;
-            
-            g_MultipleTPManager.SetTPTargets(false, ask, asianHigh, asianLow, asianMid, asianVWAP);
+            g_MultipleTPManager.SetTPTargets(false, ask, lastDayHigh, lastDayLow, lastDayMid, lastDayVWAP);
          }
       }
    }

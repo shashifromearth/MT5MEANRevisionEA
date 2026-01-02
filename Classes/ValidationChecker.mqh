@@ -43,16 +43,17 @@ CValidationChecker::~CValidationChecker()
 
 //+------------------------------------------------------------------+
 //| Calculate distance filter                                        |
-//| Price must be ≥ 1 × ATR(14) OR ≥ 0.3% of price                  |
+//| OPTIMIZED: Relaxed to reduce over-optimization                   |
+//| Price must be ≥ 0.7 × ATR(14) OR ≥ 0.2% of price                |
 //| Use MINIMUM (whichever is smaller) - satisfies OR condition     |
 //+------------------------------------------------------------------+
 double CValidationChecker::CalculateDistanceFilter(double price, double atr)
 {
-   double atrDistance = atr; // 1 × ATR(14)
-   double percentDistance = price * 0.003; // 0.3% of price
+   double atrDistance = atr * 0.7; // 0.7 × ATR(14) - relaxed from 1.0
+   double percentDistance = price * 0.002; // 0.2% of price - relaxed from 0.3%
    
    // Use MathMin: Price must be at least the smaller requirement
-   // This satisfies "≥ 1×ATR OR ≥ 0.3%" (if price meets smaller, it meets the OR condition)
+   // This satisfies "≥ 0.7×ATR OR ≥ 0.2%" (if price meets smaller, it meets the OR condition)
    return MathMin(atrDistance, percentDistance);
 }
 
@@ -61,33 +62,47 @@ double CValidationChecker::CalculateDistanceFilter(double price, double atr)
 //+------------------------------------------------------------------+
 bool CValidationChecker::IsValidSetup(double mean, double ask, double bid)
 {
-   // Check 1: Strong trend day (Higher Timeframe Break of Structure)
+   // OPTIMIZED: Simplified validation - only critical checks
+   // Removed news filter (doesn't work) and relaxed momentum filter
+   
+   // Check 1: Strong trend day (Higher Timeframe Break of Structure) - CRITICAL
    if(!CheckTrendFilter())
    {
       (*m_Logger).LogWarning("Setup rejected: Strong trend detected on higher timeframe");
       return false;
    }
    
-   // Check 2: Price already crossed mean in last 3 candles
+   // Check 2: Price already crossed mean in last 3 candles - CRITICAL
    if(CheckPriceCrossedMean(mean))
    {
       (*m_Logger).LogWarning("Setup rejected: Price already crossed mean recently");
       return false;
    }
    
-   // Check 3: High impact news within last 15 minutes
-   if(CheckNewsFilter())
+   // Check 3: Large momentum candles - RELAXED (only reject if EXTREME)
+   // Changed from 2×ATR to 3×ATR threshold
+   double atr[];
+   ArraySetAsSeries(atr, true);
+   if(CopyBuffer(m_ATRHandle, 0, 0, 1, atr) > 0)
    {
-      (*m_Logger).LogWarning("Setup rejected: High impact news detected");
-      return false;
+      double high[], low[];
+      ArraySetAsSeries(high, true);
+      ArraySetAsSeries(low, true);
+      
+      if(CopyHigh(m_Symbol, PERIOD_M5, 0, 2, high) >= 2 &&
+         CopyLow(m_Symbol, PERIOD_M5, 0, 2, low) >= 2)
+      {
+         double recentRange = high[0] - low[0];
+         // Only reject if EXTREME momentum (> 3×ATR, was 2×ATR)
+         if(recentRange > 3.0 * atr[0])
+         {
+            (*m_Logger).LogWarning("Setup rejected: Extreme momentum candles detected (>3×ATR)");
+            return false;
+         }
+      }
    }
    
-   // Check 4: Large momentum candles after entry signal
-   if(CheckMomentumCandles())
-   {
-      (*m_Logger).LogWarning("Setup rejected: Large momentum candles detected");
-      return false;
-   }
+   // News filter removed - not implemented properly
    
    return true;
 }

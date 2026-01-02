@@ -81,12 +81,14 @@ private:
    
    bool TakePartialProfit(double percent);
    bool CheckStructureBreak();
+   bool CheckMajorStructureBreak();  // More aggressive check before partial
    bool DetectTrendContinuation();
    bool CheckVWAPBehavior();
    double CalculatePartialDistance();
    bool IsStrongImpulsiveCandle(bool isLong);
    bool HasFollowThroughCandle(bool isLong);
    bool FailedToReclaimMidLevel(bool isLong, double midLevel);
+   bool FailedToReclaimMidLevelExtended(bool isLong, double midLevel);  // Extended check (5 candles)
    void UpdateTrailingStop(double currentPrice);
    void SetBreakevenStop();
    bool CheckMultiplePartials(double currentPrice);
@@ -192,10 +194,10 @@ void CProfessionalTradeManager::InitializeTrade(ulong ticket, bool isLong, doubl
       m_EntryStructureLow = entryPrice - distanceToMean * 0.1;
    }
    
-   // IMPROVED: Calculate partial distance (50-60% of distance to mean)
-   // Increased from 35% to let winners run longer
-   m_PartialDistance = distanceToMean * 0.55; // 55% (increased from 35%)
-   m_PartialPercent = 0.25; // 25% of position (reduced from 40% to keep more for bigger wins)
+   // OPTIMIZED: Delay partial profit to let winners run longer
+   // Increased from 55% to 60% to reduce over-optimization
+   m_PartialDistance = distanceToMean * 0.60; // 60% (increased from 55%)
+   m_PartialPercent = 0.20; // 20% of position (reduced from 25% to keep more for bigger wins)
    
    // Initialize multiple partial levels
    m_Partial1Taken = false;
@@ -248,21 +250,42 @@ void CProfessionalTradeManager::ManageTrade()
       }
    }
    
-   // Layer 2: Check structure break (invalidation-based exit)
-   if(CheckStructureBreak())
-   {
-      m_State = TM_STRUCTURE_BROKEN;
-      (*m_Logger).LogWarning("Structure broken - Exit signal");
-      return;
-   }
+   // OPTIMIZED: Delay exit checks until trade develops significantly
+   // Calculate how far price has moved toward mean
+   double priceMoved = m_IsLong ? (currentPrice - m_EntryPrice) : (m_EntryPrice - currentPrice);
+   double distancePercent = (m_DistanceToMean > 0) ? (priceMoved / m_DistanceToMean) : 0;
    
-   // Layer 3: Check trend continuation (hard exit)
-   if(DetectTrendContinuation())
+   // Only check structure break/trend continuation after 75% distance reached
+   // This lets trades develop fully before applying strict exit rules
+   if(distancePercent >= 0.75 || m_PartialTaken || m_Partial1Taken)
    {
-      m_State = TM_TREND_RESUMED;
-      m_TrendContinuationDetected = true;
-      (*m_Logger).LogWarning("Trend continuation detected - Exit immediately");
-      return;
+      // Layer 2: Check structure break (invalidation-based exit) - ONLY after 75% distance
+      if(CheckStructureBreak())
+      {
+         m_State = TM_STRUCTURE_BROKEN;
+         (*m_Logger).LogWarning("Structure broken - Exit signal (after 75% distance or partial)");
+         return;
+      }
+      
+      // Layer 3: Check trend continuation (hard exit) - ONLY after 75% distance
+      if(DetectTrendContinuation())
+      {
+         m_State = TM_TREND_RESUMED;
+         m_TrendContinuationDetected = true;
+         (*m_Logger).LogWarning("Trend continuation detected - Exit immediately (after 75% distance or partial)");
+         return;
+      }
+   }
+   else
+   {
+      // Before 75% distance: Only exit on MAJOR structure break (4+ candles, larger buffer)
+      // This allows normal pullbacks without exiting
+      if(CheckMajorStructureBreak())
+      {
+         m_State = TM_STRUCTURE_BROKEN;
+         (*m_Logger).LogWarning("Major structure break - Exit signal (before 75% distance)");
+         return;
+      }
    }
    
    // VWAP-specific rule
@@ -329,7 +352,7 @@ bool CProfessionalTradeManager::TakePartialProfit(double percent)
 
 //+------------------------------------------------------------------+
 //| Check structure break (invalidation-based exit)                   |
-//| IMPROVED: Requires 2 candles to confirm (reduces false exits)     |
+//| IMPROVED: Requires 3 candles + buffer zone (much less aggressive)|
 //+------------------------------------------------------------------+
 bool CProfessionalTradeManager::CheckStructureBreak()
 {
@@ -337,48 +360,122 @@ bool CProfessionalTradeManager::CheckStructureBreak()
                         SymbolInfoDouble(m_Symbol, SYMBOL_BID) : 
                         SymbolInfoDouble(m_Symbol, SYMBOL_ASK);
    
-   // Get last 2 candle closes for confirmation
+   // Get last 3 candle closes for stronger confirmation
    double close[];
    ArraySetAsSeries(close, true);
-   if(CopyClose(m_Symbol, PERIOD_M5, 0, 2, close) < 2)
+   if(CopyClose(m_Symbol, PERIOD_M5, 0, 3, close) < 3)
       return false;
    
    double candleClose0 = close[0]; // Current candle
    double candleClose1 = close[1]; // Previous candle
+   double candleClose2 = close[2]; // 2 candles ago
+   
+   // Add buffer zone (5-10 pips) to avoid false exits on normal pullbacks
+   double point = SymbolInfoDouble(m_Symbol, SYMBOL_POINT);
+   double buffer = 10 * point * 10; // 10 pips buffer
    
    bool brokeStructure = false;
    
-   // Check if broke entry structure (require 2 candles)
+   // Check if broke entry structure (require 3 candles + buffer)
    if(m_IsLong)
    {
-      // Long: exit if 2 candles close below entry structure low
-      if(candleClose0 < m_EntryStructureLow && candleClose1 < m_EntryStructureLow)
+      // Long: exit if 3 candles close below entry structure low WITH buffer
+      double structureLowWithBuffer = m_EntryStructureLow - buffer;
+      if(candleClose0 < structureLowWithBuffer && 
+         candleClose1 < structureLowWithBuffer && 
+         candleClose2 < structureLowWithBuffer)
       {
          brokeStructure = true;
-         (*m_Logger).LogWarning("Structure break (confirmed): 2 candles below entry structure");
+         (*m_Logger).LogWarning("Structure break (confirmed): 3 candles below entry structure with buffer");
       }
       
-      // Check if broke London reaction low (require 2 candles)
-      if(m_LondonReactionLow > 0 && candleClose0 < m_LondonReactionLow && candleClose1 < m_LondonReactionLow)
+      // Check if broke London reaction low (require 3 candles + buffer)
+      if(m_LondonReactionLow > 0)
       {
-         brokeStructure = true;
-         (*m_Logger).LogWarning("Structure break (confirmed): 2 candles below London reaction low");
+         double londonLowWithBuffer = m_LondonReactionLow - buffer;
+         if(candleClose0 < londonLowWithBuffer && 
+            candleClose1 < londonLowWithBuffer && 
+            candleClose2 < londonLowWithBuffer)
+         {
+            brokeStructure = true;
+            (*m_Logger).LogWarning("Structure break (confirmed): 3 candles below London reaction low with buffer");
+         }
       }
    }
    else
    {
-      // Short: exit if 2 candles close above entry structure high
-      if(candleClose0 > m_EntryStructureHigh && candleClose1 > m_EntryStructureHigh)
+      // Short: exit if 3 candles close above entry structure high WITH buffer
+      double structureHighWithBuffer = m_EntryStructureHigh + buffer;
+      if(candleClose0 > structureHighWithBuffer && 
+         candleClose1 > structureHighWithBuffer && 
+         candleClose2 > structureHighWithBuffer)
       {
          brokeStructure = true;
-         (*m_Logger).LogWarning("Structure break (confirmed): 2 candles above entry structure");
+         (*m_Logger).LogWarning("Structure break (confirmed): 3 candles above entry structure with buffer");
       }
       
-      // Check if broke London reaction high (require 2 candles)
-      if(m_LondonReactionHigh > 0 && candleClose0 > m_LondonReactionHigh && candleClose1 > m_LondonReactionHigh)
+      // Check if broke London reaction high (require 3 candles + buffer)
+      if(m_LondonReactionHigh > 0)
+      {
+         double londonHighWithBuffer = m_LondonReactionHigh + buffer;
+         if(candleClose0 > londonHighWithBuffer && 
+            candleClose1 > londonHighWithBuffer && 
+            candleClose2 > londonHighWithBuffer)
+         {
+            brokeStructure = true;
+            (*m_Logger).LogWarning("Structure break (confirmed): 3 candles above London reaction high with buffer");
+         }
+      }
+   }
+   
+   return brokeStructure;
+}
+
+//+------------------------------------------------------------------+
+//| Check major structure break (before partial profit)               |
+//| Even more aggressive - requires 4 candles + larger buffer        |
+//+------------------------------------------------------------------+
+bool CProfessionalTradeManager::CheckMajorStructureBreak()
+{
+   double currentPrice = m_IsLong ? 
+                        SymbolInfoDouble(m_Symbol, SYMBOL_BID) : 
+                        SymbolInfoDouble(m_Symbol, SYMBOL_ASK);
+   
+   // Get last 4 candle closes for very strong confirmation
+   double close[];
+   ArraySetAsSeries(close, true);
+   if(CopyClose(m_Symbol, PERIOD_M5, 0, 4, close) < 4)
+      return false;
+   
+   // Larger buffer zone (15-20 pips) before partial profit
+   double point = SymbolInfoDouble(m_Symbol, SYMBOL_POINT);
+   double buffer = 20 * point * 10; // 20 pips buffer
+   
+   bool brokeStructure = false;
+   
+   // Check if broke entry structure (require 4 candles + larger buffer)
+   if(m_IsLong)
+   {
+      double structureLowWithBuffer = m_EntryStructureLow - buffer;
+      if(close[0] < structureLowWithBuffer && 
+         close[1] < structureLowWithBuffer && 
+         close[2] < structureLowWithBuffer &&
+         close[3] < structureLowWithBuffer)
       {
          brokeStructure = true;
-         (*m_Logger).LogWarning("Structure break (confirmed): 2 candles above London reaction high");
+         (*m_Logger).LogWarning("Major structure break: 4 candles below entry structure (before partial)");
+      }
+   }
+   else
+   {
+      double structureHighWithBuffer = m_EntryStructureHigh + buffer;
+      if(close[0] > structureHighWithBuffer && 
+         close[1] > structureHighWithBuffer && 
+         close[2] > structureHighWithBuffer &&
+         close[3] > structureHighWithBuffer)
+      {
+         brokeStructure = true;
+         (*m_Logger).LogWarning("Major structure break: 4 candles above entry structure (before partial)");
       }
    }
    
@@ -387,12 +484,12 @@ bool CProfessionalTradeManager::CheckStructureBreak()
 
 //+------------------------------------------------------------------+
 //| Detect trend continuation (hard exit)                            |
-//| IMPROVED: Requires 2-3 strong impulses (less aggressive)         |
+//| IMPROVED: Requires 3-4 strong impulses + stronger confirmation   |
 //+------------------------------------------------------------------+
 bool CProfessionalTradeManager::DetectTrendContinuation()
 {
-   // IMPROVED: Require 2-3 strong impulses instead of just 1
-   // This reduces false exits during normal retracements
+   // IMPROVED: Require 3-4 strong impulses (was 2) - much less aggressive
+   // This significantly reduces false exits during normal retracements
    
    // Check 1: Strong impulsive candle with trend
    if(IsStrongImpulsiveCandle(m_IsLong))
@@ -401,32 +498,55 @@ bool CProfessionalTradeManager::DetectTrendContinuation()
    }
    else
    {
-      // Reset if no strong impulse (allows some retracements)
+      // Slowly decay count (allows some retracements without resetting)
       if(m_StrongImpulseCount > 0)
          m_StrongImpulseCount = MathMax(0, m_StrongImpulseCount - 1);
    }
    
-   // Require at least 2 strong impulses
-   if(m_StrongImpulseCount < 2)
+   // Require at least 3 strong impulses (increased from 2)
+   if(m_StrongImpulseCount < 3)
    {
       return false;
    }
    
-   // Check 2: Follow-through candle
+   // Check 2: Follow-through candle (require 2 consecutive follow-throughs)
    if(!HasFollowThroughCandle(m_IsLong))
    {
       return false;
    }
    
-   // Check 3: Failure to reclaim mid-level
+   // Additional check: Require 2 consecutive follow-through candles
+   double close[];
+   ArraySetAsSeries(close, true);
+   if(CopyClose(m_Symbol, PERIOD_M5, 0, 3, close) >= 3)
+   {
+      bool hasDoubleFollowThrough = false;
+      if(m_IsLong)
+      {
+         // For long: 2 consecutive lower closes
+         hasDoubleFollowThrough = (close[0] < close[1] && close[1] < close[2]);
+      }
+      else
+      {
+         // For short: 2 consecutive higher closes
+         hasDoubleFollowThrough = (close[0] > close[1] && close[1] > close[2]);
+      }
+      
+      if(!hasDoubleFollowThrough)
+      {
+         return false;
+      }
+   }
+   
+   // Check 3: Failure to reclaim mid-level (require 5 candles, not 3)
    double midLevel = (m_EntryPrice + m_TargetMean) / 2.0;
-   if(!FailedToReclaimMidLevel(m_IsLong, midLevel))
+   if(!FailedToReclaimMidLevelExtended(m_IsLong, midLevel))
    {
       return false;
    }
    
    // All conditions met = trend resumed
-   (*m_Logger).LogWarning(StringFormat("Trend continuation: %d strong impulses + follow-through + failed to reclaim mid", 
+   (*m_Logger).LogWarning(StringFormat("Trend continuation: %d strong impulses + double follow-through + extended mid-level failure", 
                                       m_StrongImpulseCount));
    return true;
 }
@@ -521,6 +641,38 @@ bool CProfessionalTradeManager::FailedToReclaimMidLevel(bool isLong, double midL
       // For short: price should reclaim mid-level (go below)
       // Failure = all 3 candles closed above mid-level
       bool allAbove = (low[0] > midLevel) && (low[1] > midLevel) && (low[2] > midLevel);
+      return allAbove;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check if failed to reclaim mid-level (extended - 5 candles)      |
+//+------------------------------------------------------------------+
+bool CProfessionalTradeManager::FailedToReclaimMidLevelExtended(bool isLong, double midLevel)
+{
+   double high[], low[];
+   ArraySetAsSeries(high, true);
+   ArraySetAsSeries(low, true);
+   
+   if(CopyHigh(m_Symbol, PERIOD_M5, 0, 5, high) < 5 ||
+      CopyLow(m_Symbol, PERIOD_M5, 0, 5, low) < 5)
+      return false;
+   
+   // Check last 5 candles - did price fail to reclaim mid-level?
+   if(isLong)
+   {
+      // For long: price should reclaim mid-level (go above)
+      // Failure = all 5 candles closed below mid-level
+      bool allBelow = (high[0] < midLevel) && (high[1] < midLevel) && (high[2] < midLevel) &&
+                      (high[3] < midLevel) && (high[4] < midLevel);
+      return allBelow;
+   }
+   else
+   {
+      // For short: price should reclaim mid-level (go below)
+      // Failure = all 5 candles closed above mid-level
+      bool allAbove = (low[0] > midLevel) && (low[1] > midLevel) && (low[2] > midLevel) &&
+                      (low[3] > midLevel) && (low[4] > midLevel);
       return allAbove;
    }
 }
@@ -630,27 +782,28 @@ bool CProfessionalTradeManager::CheckMultiplePartials(double currentPrice)
    double priceMoved = m_IsLong ? (currentPrice - m_EntryPrice) : (m_EntryPrice - currentPrice);
    double distancePercent = (m_DistanceToMean > 0) ? (priceMoved / m_DistanceToMean) : 0;
    
-   // Partial 1: 25% at 50% of distance to mean
-   if(!m_Partial1Taken && distancePercent >= 0.50)
+   // OPTIMIZED: Delayed partial profits to let winners run
+   // Partial 1: 20% at 60% of distance to mean (was 25% at 50%)
+   if(!m_Partial1Taken && distancePercent >= 0.60)
    {
-      if(TakePartialProfit(0.25))
+      if(TakePartialProfit(0.20))
       {
          m_Partial1Taken = true;
          m_Partial1Price = currentPrice;
          m_PartialTaken = true; // Mark as partial taken
          m_State = TM_PARTIAL_TAKEN;
-         (*m_Logger).LogInfo(StringFormat("✅ Partial 1 taken: 25%% at 50%% distance (%.5f)", currentPrice));
+         (*m_Logger).LogInfo(StringFormat("✅ Partial 1 taken: 20%% at 60%% distance (%.5f)", currentPrice));
       }
    }
    
-   // Partial 2: 25% at 75% of distance to mean
-   if(m_Partial1Taken && !m_Partial2Taken && distancePercent >= 0.75)
+   // Partial 2: 20% at 80% of distance to mean (was 25% at 75%)
+   if(m_Partial1Taken && !m_Partial2Taken && distancePercent >= 0.80)
    {
-      if(TakePartialProfit(0.25))
+      if(TakePartialProfit(0.20))
       {
          m_Partial2Taken = true;
          m_Partial2Price = currentPrice;
-         (*m_Logger).LogInfo(StringFormat("✅ Partial 2 taken: 25%% at 75%% distance (%.5f)", currentPrice));
+         (*m_Logger).LogInfo(StringFormat("✅ Partial 2 taken: 20%% at 80%% distance (%.5f)", currentPrice));
       }
    }
    

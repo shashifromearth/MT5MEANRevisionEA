@@ -34,10 +34,16 @@ private:
    double m_CachedAsianVWAP;
    datetime m_CachedAsianVWAPTime;
    
+   // Last 24-hour (last day) variables
+   double m_LastDayHigh;
+   double m_LastDayLow;
+   datetime m_LastDayResetTime;
+   
    double CalculateAsianMidpoint();
    double CalculateSessionVWAP();
    double CalculateAsianVWAP();
    void ResetDaily();
+   void CalculateLastDayRange();
    bool IsNewDay();
    bool IsNewSession();
    string GetCurrentSession();
@@ -54,6 +60,12 @@ public:
    double GetAsianMid() { return (m_AsianHigh > 0 && m_AsianLow < DBL_MAX) ? (m_AsianHigh + m_AsianLow) / 2.0 : 0; }
    double GetAsianVWAP();
    bool IsAsianRangeValid() { return (m_AsianHigh > 0 && m_AsianLow < DBL_MAX); }
+   
+   // Last 24-hour (last day) calculations
+   double GetLastDayHigh();
+   double GetLastDayLow();
+   double GetLastDayMid();
+   bool IsLastDayRangeValid();
 };
 
 //+------------------------------------------------------------------+
@@ -78,6 +90,9 @@ CMeanCalculator::CMeanCalculator(MEAN_TYPE method, string symbol, CLogger* logge
    m_AsianVWAPStartTime = 0;
    m_CachedAsianVWAP = 0;
    m_CachedAsianVWAPTime = 0;
+   m_LastDayHigh = 0;
+   m_LastDayLow = DBL_MAX;
+   m_LastDayResetTime = 0;
 }
 
 //+------------------------------------------------------------------+
@@ -310,6 +325,95 @@ void CMeanCalculator::ResetDaily()
    m_CachedAsianVWAPTime = 0;
    
    (*m_Logger).LogInfo("Daily reset: Asian range reset for new day");
+   
+   // Calculate last day range
+   CalculateLastDayRange();
+}
+
+//+------------------------------------------------------------------+
+//| Calculate last 24-hour (last day) high, low, and mid             |
+//+------------------------------------------------------------------+
+void CMeanCalculator::CalculateLastDayRange()
+{
+   // Get all bars from last 24 hours (288 bars for M5 = 24 hours)
+   int barsToCheck = 288; // 24 hours * 12 bars per hour
+   int totalBars = iBars(m_Symbol, PERIOD_M5);
+   if(barsToCheck > totalBars) barsToCheck = totalBars;
+   
+   double high[], low[];
+   ArraySetAsSeries(high, true);
+   ArraySetAsSeries(low, true);
+   
+   if(CopyHigh(m_Symbol, PERIOD_M5, 0, barsToCheck, high) > 0 &&
+      CopyLow(m_Symbol, PERIOD_M5, 0, barsToCheck, low) > 0)
+   {
+      m_LastDayHigh = 0;
+      m_LastDayLow = DBL_MAX;
+      
+      // Find high and low from last 24 hours
+      for(int i = 0; i < barsToCheck; i++)
+      {
+         if(high[i] > m_LastDayHigh) m_LastDayHigh = high[i];
+         if(low[i] < m_LastDayLow) m_LastDayLow = low[i];
+      }
+      
+      m_LastDayResetTime = TimeCurrent();
+      
+      if(m_LastDayHigh > 0 && m_LastDayLow < DBL_MAX)
+      {
+         (*m_Logger).LogInfo(StringFormat("Last day range calculated: High=%.5f, Low=%.5f, Mid=%.5f", 
+                                         m_LastDayHigh, m_LastDayLow, (m_LastDayHigh + m_LastDayLow) / 2.0));
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get last day high                                                |
+//+------------------------------------------------------------------+
+double CMeanCalculator::GetLastDayHigh()
+{
+   // Recalculate if it's a new day or not initialized
+   if(IsNewDay() || m_LastDayHigh == 0)
+   {
+      CalculateLastDayRange();
+   }
+   return m_LastDayHigh;
+}
+
+//+------------------------------------------------------------------+
+//| Get last day low                                                 |
+//+------------------------------------------------------------------+
+double CMeanCalculator::GetLastDayLow()
+{
+   // Recalculate if it's a new day or not initialized
+   if(IsNewDay() || m_LastDayLow == DBL_MAX)
+   {
+      CalculateLastDayRange();
+   }
+   return m_LastDayLow;
+}
+
+//+------------------------------------------------------------------+
+//| Get last day mid (mean)                                          |
+//+------------------------------------------------------------------+
+double CMeanCalculator::GetLastDayMid()
+{
+   double high = GetLastDayHigh();
+   double low = GetLastDayLow();
+   
+   if(high > 0 && low < DBL_MAX)
+   {
+      return (high + low) / 2.0;
+   }
+   return 0;
+}
+
+//+------------------------------------------------------------------+
+//| Check if last day range is valid                                 |
+//+------------------------------------------------------------------+
+bool CMeanCalculator::IsLastDayRangeValid()
+{
+   return (m_LastDayHigh > 0 && m_LastDayLow < DBL_MAX);
 }
 
 //+------------------------------------------------------------------+
