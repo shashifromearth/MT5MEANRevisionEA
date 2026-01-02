@@ -61,7 +61,7 @@ bool CTradeExecutor::ExecuteBuy(double entryPrice, double stopLoss, double takeP
    request.sl = stopLoss;
    request.tp = takeProfit;
    request.deviation = 10;
-   request.magic = 123456;
+   request.magic = 123456; // EA_MAGIC_NUMBER
    request.comment = comment;
    request.type_filling = ORDER_FILLING_FOK;
    
@@ -95,7 +95,7 @@ bool CTradeExecutor::ExecuteSell(double entryPrice, double stopLoss, double take
    request.sl = stopLoss;
    request.tp = takeProfit;
    request.deviation = 10;
-   request.magic = 123456;
+   request.magic = 123456; // EA_MAGIC_NUMBER
    request.comment = comment;
    request.type_filling = ORDER_FILLING_FOK;
    

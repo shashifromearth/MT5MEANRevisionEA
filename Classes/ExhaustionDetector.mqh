@@ -132,6 +132,7 @@ bool CExhaustionDetector::DetectInsideCandle()
 //+------------------------------------------------------------------+
 //| Detect small bodies pattern                                      |
 //| Two consecutive candles with bodies < 40% of prior impulse      |
+//| Prior impulse = largest range in last 5-10 candles              |
 //+------------------------------------------------------------------+
 bool CExhaustionDetector::DetectSmallBodies()
 {
@@ -141,26 +142,35 @@ bool CExhaustionDetector::DetectSmallBodies()
    ArraySetAsSeries(low, true);
    ArraySetAsSeries(close, true);
    
-   if(CopyOpen(m_Symbol, PERIOD_M5, 0, 3, open) < 3 ||
-      CopyHigh(m_Symbol, PERIOD_M5, 0, 3, high) < 3 ||
-      CopyLow(m_Symbol, PERIOD_M5, 0, 3, low) < 3 ||
-      CopyClose(m_Symbol, PERIOD_M5, 0, 3, close) < 3)
+   // Need at least 10 candles to find largest range
+   if(CopyOpen(m_Symbol, PERIOD_M5, 0, 10, open) < 10 ||
+      CopyHigh(m_Symbol, PERIOD_M5, 0, 10, high) < 10 ||
+      CopyLow(m_Symbol, PERIOD_M5, 0, 10, low) < 10 ||
+      CopyClose(m_Symbol, PERIOD_M5, 0, 10, close) < 10)
    {
       return false;
    }
    
-   // Find prior impulse (largest range in last 5-10 candles)
-   // For simplicity, use candle at index 2 as reference
-   double impulseRange = high[2] - low[2];
-   if(impulseRange <= 0) return false;
+   // Find prior impulse: largest range in last 5-10 candles (indices 2-9)
+   double maxRange = 0;
+   for(int i = 2; i < 10; i++)
+   {
+      double range = high[i] - low[i];
+      if(range > maxRange)
+      {
+         maxRange = range;
+      }
+   }
    
-   // Calculate body sizes for last two candles
+   if(maxRange <= 0) return false;
+   
+   // Calculate body sizes for last two candles (indices 0 and 1)
    double body1 = MathAbs(close[0] - open[0]);
    double body2 = MathAbs(close[1] - open[1]);
    
-   // Check if both bodies are < 40% of impulse range
-   bool smallBody1 = (body1 < 0.4 * impulseRange);
-   bool smallBody2 = (body2 < 0.4 * impulseRange);
+   // Check if both bodies are < 40% of prior impulse range
+   bool smallBody1 = (body1 < 0.4 * maxRange);
+   bool smallBody2 = (body2 < 0.4 * maxRange);
    
    return (smallBody1 && smallBody2);
 }

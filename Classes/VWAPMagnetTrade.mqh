@@ -178,8 +178,7 @@ bool CVWAPMagnetTrade::HasVWAPFlipped()
 {
    if(m_MeanCalculator == NULL) return false;
    
-   double currentVWAP = 0;
-   currentVWAP = m_MeanCalculator->GetMean();
+   double currentVWAP = (*m_MeanCalculator).GetMean();
    
    if(m_LastVWAP > 0 && currentVWAP > 0)
    {

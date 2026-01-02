@@ -43,14 +43,17 @@ CValidationChecker::~CValidationChecker()
 
 //+------------------------------------------------------------------+
 //| Calculate distance filter                                        |
-//| MIN(1 × ATR(14), 0.3% of current price)                         |
+//| Price must be ≥ 1 × ATR(14) OR ≥ 0.3% of price                  |
+//| Use MINIMUM (whichever is smaller) - satisfies OR condition     |
 //+------------------------------------------------------------------+
 double CValidationChecker::CalculateDistanceFilter(double price, double atr)
 {
-   double atrDistance = atr;
-   double percentDistance = price * 0.003; // 0.3%
+   double atrDistance = atr; // 1 × ATR(14)
+   double percentDistance = price * 0.003; // 0.3% of price
    
-   return MathMax(atrDistance, percentDistance);
+   // Use MathMin: Price must be at least the smaller requirement
+   // This satisfies "≥ 1×ATR OR ≥ 0.3%" (if price meets smaller, it meets the OR condition)
+   return MathMin(atrDistance, percentDistance);
 }
 
 //+------------------------------------------------------------------+

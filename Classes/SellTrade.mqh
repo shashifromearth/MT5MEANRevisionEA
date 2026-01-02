@@ -62,6 +62,21 @@ CSellTrade::~CSellTrade()
 //+------------------------------------------------------------------+
 bool CSellTrade::ExecuteTrade(double mean, double distanceFilter, double atr, int exhaustionType)
 {
+   // CRITICAL SAFETY CHECK: Verify no position exists before execution
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0 && PositionSelectByTicket(ticket))
+      {
+         if(PositionGetString(POSITION_SYMBOL) == m_Symbol && 
+            PositionGetInteger(POSITION_MAGIC) == 123456) // EA_MAGIC_NUMBER
+         {
+            (*m_Logger).LogWarning("Sell trade blocked: Position already exists (safety check)");
+            return false;
+         }
+      }
+   }
+   
    // Get current price
    double ask = SymbolInfoDouble(m_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(m_Symbol, SYMBOL_BID);

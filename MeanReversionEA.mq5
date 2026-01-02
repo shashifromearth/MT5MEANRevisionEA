@@ -29,7 +29,7 @@
 //| Input Parameters                                                 |
 //+------------------------------------------------------------------+
 input string   TRADE_SETTINGS    = "--- Trade Settings ---";
-input double   LotSize           = 0.01;
+input double   LotSize           = 1.0;
 input bool     UseMoneyManagement = false;
 input double   RiskPercent       = 1.0;
 input string   Symbol1           = "EURUSD";
@@ -54,7 +54,7 @@ input int      NYEndHour         = 14;
 input int      NYEndMinute       = 0;
 
 input string   RISK_SETTINGS     = "--- Risk Management ---";
-input int      MaxTradesPerSession = 2;
+input int      MaxTradesPerDay = 2; // Max 2 trades per session (London or NY)
 input bool     EnableLossCoolDown = true;
 input int      LossCoolDownMinutes = 15;
 
@@ -85,6 +85,55 @@ CProfessionalTradeManager* g_ProfessionalTradeManager;
 string g_CurrentSymbol;
 datetime g_LastBarTime = 0;
 int g_ATRHandle = INVALID_HANDLE;
+const int EA_MAGIC_NUMBER = 123456;
+ulong g_LastCloseAttemptTicket = 0; // Prevent multiple close attempts
+datetime g_LastCloseAttemptTime = 0;
+
+//+------------------------------------------------------------------+
+//| Check if EA has an open position (with magic number filter)     |
+//+------------------------------------------------------------------+
+bool HasEAPosition(string symbol)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0)
+      {
+         if(PositionSelectByTicket(ticket))
+         {
+            if(PositionGetString(POSITION_SYMBOL) == symbol && 
+               PositionGetInteger(POSITION_MAGIC) == EA_MAGIC_NUMBER)
+            {
+               return true;
+            }
+         }
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Get EA position ticket (with magic number filter)                |
+//+------------------------------------------------------------------+
+ulong GetEAPositionTicket(string symbol)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0)
+      {
+         if(PositionSelectByTicket(ticket))
+         {
+            if(PositionGetString(POSITION_SYMBOL) == symbol && 
+               PositionGetInteger(POSITION_MAGIC) == EA_MAGIC_NUMBER)
+            {
+               return ticket;
+            }
+         }
+      }
+   }
+   return 0;
+}
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -109,7 +158,7 @@ int OnInit()
    g_MeanCalculator = new CMeanCalculator(MeanMethod, g_CurrentSymbol, g_Logger);
    g_ExhaustionDetector = new CExhaustionDetector(g_CurrentSymbol, g_Logger);
    g_RiskManager = new CRiskManager(TakeProfitMethod, UseAutoCloseRule, g_ATRHandle, g_CurrentSymbol, g_Logger);
-   g_SessionManager = new CSessionManager(MaxTradesPerSession, EnableLossCoolDown, LossCoolDownMinutes, g_Logger);
+   g_SessionManager = new CSessionManager(MaxTradesPerDay, EnableLossCoolDown, LossCoolDownMinutes, g_Logger);
    g_ValidationChecker = new CValidationChecker(g_CurrentSymbol, g_ATRHandle, g_Logger);
    g_TradeExecutor = new CTradeExecutor(LotSize, UseMoneyManagement, RiskPercent, g_CurrentSymbol, g_Logger);
    g_BuyTrade = new CBuyTrade(g_TradeExecutor, g_RiskManager, g_MeanCalculator, g_ExhaustionDetector,
@@ -198,29 +247,32 @@ void OnTick()
    }
    
    // PROFESSIONAL TRADE MANAGEMENT - Always active (even outside sessions)
-   if(PositionSelect(g_CurrentSymbol))
+   if(HasEAPosition(g_CurrentSymbol))
    {
-      g_ProfessionalTradeManager.ManageTrade();
-      
-      if(g_ProfessionalTradeManager.ShouldExitTrade())
+      ulong ticket = GetEAPositionTicket(g_CurrentSymbol);
+      if(ticket > 0 && PositionSelectByTicket(ticket))
       {
-         ulong ticket = PositionGetInteger(POSITION_TICKET);
-         bool isLong = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
-         string exitReason = g_ProfessionalTradeManager.GetExitReason();
+         g_ProfessionalTradeManager.ManageTrade();
          
-         MqlTradeRequest request = {};
-         MqlTradeResult result = {};
-         request.action = TRADE_ACTION_DEAL;
-         request.symbol = g_CurrentSymbol;
-         request.volume = PositionGetDouble(POSITION_VOLUME);
-         request.type = isLong ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
-         request.deviation = 10;
-         request.magic = 123456;
-         request.comment = StringFormat("Professional exit: %s", exitReason);
-         
-         if(OrderSend(request, result))
+         if(g_ProfessionalTradeManager.ShouldExitTrade())
          {
-            g_Logger.LogInfo(StringFormat("Trade closed: %s", exitReason));
+            bool isLong = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+            string exitReason = g_ProfessionalTradeManager.GetExitReason();
+            
+            MqlTradeRequest request = {};
+            MqlTradeResult result = {};
+            request.action = TRADE_ACTION_DEAL;
+            request.symbol = g_CurrentSymbol;
+            request.volume = PositionGetDouble(POSITION_VOLUME);
+            request.type = isLong ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+            request.deviation = 10;
+            request.magic = EA_MAGIC_NUMBER;
+            request.comment = StringFormat("Professional exit: %s", exitReason);
+            
+            if(OrderSend(request, result))
+            {
+               g_Logger.LogInfo(StringFormat("Trade closed: %s", exitReason));
+            }
          }
       }
    }
@@ -249,73 +301,119 @@ void OnTick()
       return;
    }
    
-   // Check if we already have an open position
-   if(PositionSelect(g_CurrentSymbol))
+   // CRITICAL: Check if we already have an open position (EA's position only)
+   // This check MUST happen BEFORE any trade execution logic
+   if(HasEAPosition(g_CurrentSymbol))
    {
-      // Monitor existing position
-      ulong ticket = PositionGetInteger(POSITION_TICKET);
-      bool isLong = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
-      double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-      
-      // PROFESSIONAL TRADE MANAGEMENT (Priority 1)
-      g_ProfessionalTradeManager.ManageTrade();
-      
-      // Check if professional manager says to exit
-      if(g_ProfessionalTradeManager.ShouldExitTrade())
+      ulong ticket = GetEAPositionTicket(g_CurrentSymbol);
+      if(ticket > 0 && PositionSelectByTicket(ticket))
       {
-         string exitReason = g_ProfessionalTradeManager.GetExitReason();
-         MqlTradeRequest request = {};
-         MqlTradeResult result = {};
-         request.action = TRADE_ACTION_DEAL;
-         request.symbol = g_CurrentSymbol;
-         request.volume = PositionGetDouble(POSITION_VOLUME);
-         request.type = isLong ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
-         request.deviation = 10;
-         request.magic = 123456;
-         request.comment = StringFormat("Professional exit: %s", exitReason);
+         // Monitor existing position ONLY - NO NEW TRADES
+         bool isLong = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+         double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
          
-         if(OrderSend(request, result))
+         if(EnableDetailedLog)
          {
-            g_Logger.LogInfo(StringFormat("Trade closed: %s", exitReason));
+            g_Logger.LogInfo(StringFormat("Position exists (Ticket: %llu) - Monitoring only, NO NEW TRADE", ticket));
          }
-         return;
-      }
-      
-      // Monitor multiple TPs (if not using professional manager)
-      if(g_RiskManager.IsMultipleTPMethod() && !g_ProfessionalTradeManager.ShouldExitTrade())
-      {
-         g_MultipleTPManager.MonitorPosition(ticket);
-      }
-      
-      // Monitor VWAP Magnet Trade exit
-      double vwap = g_MeanCalculator.GetMean();
-      if(vwap > 0)
-      {
-         double currentPrice = SymbolInfoDouble(g_CurrentSymbol, SYMBOL_ASK);
-         if(!isLong) currentPrice = SymbolInfoDouble(g_CurrentSymbol, SYMBOL_BID);
          
-         if(g_VWAPMagnetTrade.ShouldExitVWAPMagnetTrade(currentPrice, vwap))
+         // PROFESSIONAL TRADE MANAGEMENT (Priority 1)
+         g_ProfessionalTradeManager.ManageTrade();
+         
+         // Check if professional manager says to exit
+         if(g_ProfessionalTradeManager.ShouldExitTrade())
          {
-            // Close VWAP Magnet Trade
+            // Prevent multiple close attempts for same position in same second
+            datetime currentTime = TimeCurrent();
+            if(g_LastCloseAttemptTicket == ticket && (currentTime - g_LastCloseAttemptTime) < 1)
+            {
+               return; // Already tried to close this position recently
+            }
+            
+            g_LastCloseAttemptTicket = ticket;
+            g_LastCloseAttemptTime = currentTime;
+            
+            string exitReason = g_ProfessionalTradeManager.GetExitReason();
             MqlTradeRequest request = {};
             MqlTradeResult result = {};
             request.action = TRADE_ACTION_DEAL;
+            request.position = ticket; // CRITICAL: Specify which position to close
             request.symbol = g_CurrentSymbol;
             request.volume = PositionGetDouble(POSITION_VOLUME);
             request.type = isLong ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
             request.deviation = 10;
-            request.magic = 123456;
-            request.comment = "VWAP Magnet Trade exit";
-            if(!OrderSend(request, result))
+            request.magic = EA_MAGIC_NUMBER;
+            request.comment = StringFormat("Professional exit: %s", exitReason);
+            
+            if(OrderSend(request, result))
             {
-               g_Logger.LogError(StringFormat("Failed to close VWAP Magnet Trade: %s", result.comment));
+               g_Logger.LogInfo(StringFormat("Trade closed: %s", exitReason));
+               g_LastCloseAttemptTicket = 0; // Reset on success
+            }
+            else
+            {
+               // If "No money" error, log and stop trying (prevent infinite loop)
+               if(result.retcode == 10004 || result.retcode == 10019) // TRADE_RETCODE_NO_MONEY or TRADE_RETCODE_NOT_ENOUGH_MONEY
+               {
+                  g_Logger.LogWarning("Insufficient margin to close position - will retry when margin available");
+                  // Don't reset ticket - prevent retry for 60 seconds
+                  g_LastCloseAttemptTime = currentTime + 60;
+               }
+               else
+               {
+                  g_Logger.LogError(StringFormat("Failed to close position: %s (retcode: %d)", result.comment, result.retcode));
+               }
+            }
+            return;
+         }
+         
+         // Monitor multiple TPs (if not using professional manager)
+         if(g_RiskManager.IsMultipleTPMethod() && !g_ProfessionalTradeManager.ShouldExitTrade())
+         {
+            g_MultipleTPManager.MonitorPosition(ticket);
+         }
+         
+         // Monitor VWAP Magnet Trade exit
+         double vwap = g_MeanCalculator.GetMean();
+         if(vwap > 0)
+         {
+            double currentPrice = SymbolInfoDouble(g_CurrentSymbol, SYMBOL_ASK);
+            if(!isLong) currentPrice = SymbolInfoDouble(g_CurrentSymbol, SYMBOL_BID);
+            
+            if(g_VWAPMagnetTrade.ShouldExitVWAPMagnetTrade(currentPrice, vwap))
+            {
+               // Close VWAP Magnet Trade
+               MqlTradeRequest request = {};
+               MqlTradeResult result = {};
+               request.action = TRADE_ACTION_DEAL;
+               request.position = ticket; // CRITICAL: Specify which position to close
+               request.symbol = g_CurrentSymbol;
+               request.volume = PositionGetDouble(POSITION_VOLUME);
+               request.type = isLong ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+               request.deviation = 10;
+               request.magic = EA_MAGIC_NUMBER;
+               request.comment = "VWAP Magnet Trade exit";
+               if(!OrderSend(request, result))
+               {
+                  // If "No money" error, stop trying (prevent infinite loop)
+                  if(result.retcode == 10004 || result.retcode == 10019) // TRADE_RETCODE_NO_MONEY or TRADE_RETCODE_NOT_ENOUGH_MONEY
+                  {
+                     g_Logger.LogWarning("Insufficient margin to close VWAP Magnet Trade - will retry when margin available");
+                  }
+                  else
+                  {
+                     g_Logger.LogError(StringFormat("Failed to close VWAP Magnet Trade: %s (retcode: %d)", result.comment, result.retcode));
+                  }
+               }
             }
          }
+         
+         if(UseAutoCloseRule)
+            g_RiskManager.MonitorPositions(g_MeanCalculator);
+         
+         // CRITICAL: Return here - NO NEW TRADE while position exists
+         return;
       }
-      
-      if(UseAutoCloseRule)
-         g_RiskManager.MonitorPositions(g_MeanCalculator);
-      return;
    }
    
    // Get current market data
@@ -344,10 +442,24 @@ void OnTick()
    if(distanceFromMean < distanceFilter)
    {
       // Price too close to mean, reject trade
+      if(EnableDetailedLog)
+         g_Logger.LogInfo(StringFormat("Trade rejected: Distance from mean (%.5f) < filter (%.5f)", distanceFromMean, distanceFilter));
       return;
    }
    
+   // CRITICAL: Exhaustion confirmation is MANDATORY (no exhaustion → no entry)
+   int exhaustionType = g_ExhaustionDetector.DetectExhaustion();
+   bool hasExhaustion = (exhaustionType != EXHAUSTION_NONE);
+   
+   if(!hasExhaustion)
+   {
+      if(EnableDetailedLog)
+         g_Logger.LogWarning("Trade rejected: No exhaustion pattern detected - exhaustion is mandatory");
+      return; // NO TRADE without exhaustion
+   }
+   
    // ENHANCEMENT: Prevent mid-box entries (only enter near extremes after sweep)
+   // RELAXED: Only reject if no exhaustion AND no sweep rejection
    if(g_MeanCalculator.IsAsianRangeValid())
    {
       double asianHigh = g_MeanCalculator.GetAsianHigh();
@@ -357,30 +469,30 @@ void OnTick()
       
       if(boxRange > 0)
       {
-         // Check if price is in middle 40% of box (mid-box) - reject
+         // Check if price is in middle 40% of box (mid-box)
          double pricePosition = (ask - asianLow) / boxRange;
          bool isMidBox = (pricePosition > 0.30 && pricePosition < 0.70);
          
-         // Only allow mid-box entry if we had a confirmed sweep rejection
-         if(isMidBox && !g_DeadZoneManager.IsSweepRejected())
+         // Only reject mid-box entry if NO exhaustion AND NO sweep rejection
+         if(isMidBox && !hasExhaustion && !g_DeadZoneManager.IsSweepRejected())
          {
-            g_Logger.LogInfo("Trade rejected: Mid-box entry without confirmed sweep rejection");
+            if(EnableDetailedLog)
+               g_Logger.LogInfo("Trade rejected: Mid-box entry without exhaustion or sweep rejection");
             return;
          }
+         else if(isMidBox && (hasExhaustion || g_DeadZoneManager.IsSweepRejected()))
+         {
+            if(EnableDetailedLog)
+               g_Logger.LogInfo("Mid-box entry allowed: Exhaustion or sweep rejection present");
+         }
       }
-   }
-   
-   // Check for exhaustion patterns
-   int exhaustionType = g_ExhaustionDetector.DetectExhaustion();
-   if(exhaustionType == EXHAUSTION_NONE)
-   {
-      return;
    }
    
    // Validate setup
    if(!g_ValidationChecker.IsValidSetup(mean, ask, bid))
    {
-      g_Logger.LogWarning("Setup validation failed - rejecting trade");
+      if(EnableDetailedLog)
+         g_Logger.LogWarning("Setup validation failed - rejecting trade (check trend/news/momentum filters)");
       return;
    }
    
@@ -424,7 +536,8 @@ void OnTick()
       }
    }
    
-   // CRITICAL: Check dead zone break confirmation (London only)
+   // RELAXED: Check dead zone break confirmation (London only) - prefer but don't require
+   bool londonConfirmationPassed = true;
    if(g_TimeManager.IsLondonSession())
    {
       // Update Asian range before checking
@@ -436,18 +549,42 @@ void OnTick()
       // Check if we can enter based on dead zone break logic
       if(isLongSetup)
       {
-         if(!g_DeadZoneManager.CanEnterTrade(ask, true))
+         londonConfirmationPassed = g_DeadZoneManager.CanEnterTrade(ask, true);
+         if(!londonConfirmationPassed)
          {
-            g_Logger.LogInfo("Long setup rejected: Waiting for London confirmation of dead zone break");
-            return;
+            // RELAXED: If we have exhaustion or price is far from mean, allow trade anyway
+            if(hasExhaustion || distanceFromMean > distanceFilter * 1.5)
+            {
+               if(EnableDetailedLog)
+                  g_Logger.LogInfo("Long setup: London confirmation pending but allowing due to exhaustion or strong distance");
+               londonConfirmationPassed = true; // Override
+            }
+            else
+            {
+               if(EnableDetailedLog)
+                  g_Logger.LogInfo("Long setup rejected: Waiting for London confirmation of dead zone break");
+               return;
+            }
          }
       }
       else if(isShortSetup)
       {
-         if(!g_DeadZoneManager.CanEnterTrade(ask, false))
+         londonConfirmationPassed = g_DeadZoneManager.CanEnterTrade(ask, false);
+         if(!londonConfirmationPassed)
          {
-            g_Logger.LogInfo("Short setup rejected: Waiting for London confirmation of dead zone break");
-            return;
+            // RELAXED: If we have exhaustion or price is far from mean, allow trade anyway
+            if(hasExhaustion || distanceFromMean > distanceFilter * 1.5)
+            {
+               if(EnableDetailedLog)
+                  g_Logger.LogInfo("Short setup: London confirmation pending but allowing due to exhaustion or strong distance");
+               londonConfirmationPassed = true; // Override
+            }
+            else
+            {
+               if(EnableDetailedLog)
+                  g_Logger.LogInfo("Short setup rejected: Waiting for London confirmation of dead zone break");
+               return;
+            }
          }
       }
    }
@@ -499,43 +636,82 @@ void OnTick()
       return; // Wait for candle to close
    }
    
+   // Log trade setup summary
+   if(EnableDetailedLog)
+   {
+      string setupSummary = StringFormat("=== TRADE SETUP SUMMARY ===\n" +
+                                        "Direction: %s\n" +
+                                        "Distance from Mean: %.5f (Filter: %.5f)\n" +
+                                        "Exhaustion: %s\n" +
+                                        "London Confirmation: %s\n" +
+                                        "Mid-Box: %s\n" +
+                                        "Mean: %.5f | Ask: %.5f",
+                                        isLongSetup ? "LONG" : "SHORT",
+                                        distanceFromMean, distanceFilter,
+                                        hasExhaustion ? "YES" : "NO",
+                                        londonConfirmationPassed ? "YES" : "NO",
+                                        g_MeanCalculator.IsAsianRangeValid() ? "CHECKED" : "N/A",
+                                        mean, ask);
+      g_Logger.LogInfo(setupSummary);
+   }
+   
+   // CRITICAL: Double-check position before execution (prevent race condition)
+   if(HasEAPosition(g_CurrentSymbol))
+   {
+      if(EnableDetailedLog)
+         g_Logger.LogWarning("Trade execution blocked: Position exists - preventing duplicate trade");
+      return;
+   }
+   
    // Execute trade
    if(isLongSetup)
    {
+      // TRIPLE-CHECK: Verify no position exists right before execution
+      if(HasEAPosition(g_CurrentSymbol))
+      {
+         g_Logger.LogWarning("Trade execution blocked at final check: Position exists");
+         return;
+      }
+      
       if(g_BuyTrade.ExecuteTrade(mean, distanceFilter, atr[0], exhaustionType))
       {
+         // Count trade ONLY when we actually open a position
+         g_SessionManager.OnTrade();
          g_PerformanceMetrics.OnTradeOpen();
          
          // Initialize professional trade manager
-         if(PositionSelect(g_CurrentSymbol))
+         if(HasEAPosition(g_CurrentSymbol))
          {
-            ulong ticket = PositionGetInteger(POSITION_TICKET);
-            double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-            
-            // Get London reaction levels (high/low from London session start)
-            double londonReactionHigh = 0;
-            double londonReactionLow = DBL_MAX;
-            if(g_TimeManager.IsLondonSession())
+            ulong ticket = GetEAPositionTicket(g_CurrentSymbol);
+            if(ticket > 0 && PositionSelectByTicket(ticket))
             {
-               // Get London session candles
-               double high[], low[];
-               ArraySetAsSeries(high, true);
-               ArraySetAsSeries(low, true);
+               double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
                
-               // Get last 10 candles (London session)
-               if(CopyHigh(g_CurrentSymbol, PERIOD_M5, 0, 10, high) >= 10 &&
-                  CopyLow(g_CurrentSymbol, PERIOD_M5, 0, 10, low) >= 10)
+               // Get London reaction levels (high/low from London session start)
+               double londonReactionHigh = 0;
+               double londonReactionLow = DBL_MAX;
+               if(g_TimeManager.IsLondonSession())
                {
-                  londonReactionHigh = high[ArrayMaximum(high, 0, 10)];
-                  londonReactionLow = low[ArrayMinimum(low, 0, 10)];
+                  // Get London session candles
+                  double high[], low[];
+                  ArraySetAsSeries(high, true);
+                  ArraySetAsSeries(low, true);
+                  
+                  // Get last 10 candles (London session)
+                  if(CopyHigh(g_CurrentSymbol, PERIOD_M5, 0, 10, high) >= 10 &&
+                     CopyLow(g_CurrentSymbol, PERIOD_M5, 0, 10, low) >= 10)
+                  {
+                     londonReactionHigh = high[ArrayMaximum(high, 0, 10)];
+                     londonReactionLow = low[ArrayMinimum(low, 0, 10)];
+                  }
                }
+               
+               double targetVWAP = g_MeanCalculator.GetAsianVWAP();
+               if(targetVWAP <= 0) targetVWAP = mean;
+               
+               g_ProfessionalTradeManager.InitializeTrade(ticket, true, entryPrice, mean, targetVWAP, 
+                                                          distanceFromMean, londonReactionHigh, londonReactionLow);
             }
-            
-            double targetVWAP = g_MeanCalculator.GetAsianVWAP();
-            if(targetVWAP <= 0) targetVWAP = mean;
-            
-            g_ProfessionalTradeManager.InitializeTrade(ticket, true, entryPrice, mean, targetVWAP, 
-                                                       distanceFromMean, londonReactionHigh, londonReactionLow);
          }
          
          // Set multiple TP targets if enabled (fallback)
@@ -555,14 +731,26 @@ void OnTick()
    }
    else if(isShortSetup)
    {
+      // TRIPLE-CHECK: Verify no position exists right before execution
+      if(HasEAPosition(g_CurrentSymbol))
+      {
+         g_Logger.LogWarning("Trade execution blocked at final check: Position exists");
+         return;
+      }
+      
       if(g_SellTrade.ExecuteTrade(mean, distanceFilter, atr[0], exhaustionType))
       {
+         // Count trade ONLY when we actually open a position
+         g_SessionManager.OnTrade();
          g_PerformanceMetrics.OnTradeOpen();
          
          // Initialize professional trade manager
-         if(PositionSelect(g_CurrentSymbol))
+         // CRITICAL: Use HasEAPosition to filter by magic number
+         if(HasEAPosition(g_CurrentSymbol))
          {
-            ulong ticket = PositionGetInteger(POSITION_TICKET);
+            ulong ticket = GetEAPositionTicket(g_CurrentSymbol);
+            if(ticket == 0 || !PositionSelectByTicket(ticket))
+               return;
             double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
             
             // Get London reaction levels
@@ -615,23 +803,37 @@ void OnTick()
 //+------------------------------------------------------------------+
 void OnTrade()
 {
-   // Check if we have an open position
-   if(PositionSelect(g_CurrentSymbol))
+   // Check if we have an EA position (with magic number filter)
+   if(HasEAPosition(g_CurrentSymbol))
    {
-      // New position opened or existing position modified
-      g_SessionManager.OnTrade();
+      // EA position exists - update risk manager (but DON'T count trade here)
+      // Trade is counted when we actually execute it, not in OnTrade() event
       g_RiskManager.OnTrade();
    }
    else
    {
-      // Position was closed - check if it was a loss
+      // EA position was closed - check if it was a loss
       HistorySelect(TimeCurrent() - 86400, TimeCurrent()); // Last 24 hours
       int totalDeals = HistoryDealsTotal();
       
       if(totalDeals > 0)
       {
-         // Get the most recent deal
-         ulong ticket = HistoryDealGetTicket(totalDeals - 1);
+         // Find the most recent EA deal (magic number filter)
+         ulong ticket = 0;
+         for(int i = totalDeals - 1; i >= 0; i--)
+         {
+            ulong dealTicket = HistoryDealGetTicket(i);
+            if(dealTicket > 0)
+            {
+               if(HistoryDealGetInteger(dealTicket, DEAL_MAGIC) == EA_MAGIC_NUMBER &&
+                  HistoryDealGetString(dealTicket, DEAL_SYMBOL) == g_CurrentSymbol)
+               {
+                  ticket = dealTicket;
+                  break;
+               }
+            }
+         }
+         
          if(ticket > 0)
          {
             double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT);

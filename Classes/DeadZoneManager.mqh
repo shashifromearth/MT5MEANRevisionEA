@@ -125,7 +125,7 @@ void CDeadZoneManager::OnNewBar()
    bool inDeadZone = false;
    if(m_TimeManager != NULL)
    {
-      inDeadZone = m_TimeManager->IsDeadZone();
+      inDeadZone = (*m_TimeManager).IsDeadZone();
    }
    
    if(inDeadZone)
@@ -177,7 +177,7 @@ void CDeadZoneManager::OnNewBar()
    bool inLondonSession = false;
    if(m_TimeManager != NULL)
    {
-      inLondonSession = m_TimeManager->IsLondonSession();
+      inLondonSession = (*m_TimeManager).IsLondonSession();
    }
    
    if(inLondonSession)
@@ -210,7 +210,8 @@ void CDeadZoneManager::OnNewBar()
       bool notInLondon = false;
       if(m_TimeManager != NULL)
       {
-         notInLondon = !m_TimeManager->IsLondonSession();
+         bool isLondon = (*m_TimeManager).IsLondonSession();
+         notInLondon = !isLondon;
       }
       if(m_LondonOpenTime > 0 && notInLondon)
       {
@@ -222,8 +223,10 @@ void CDeadZoneManager::OnNewBar()
    bool pastLondonSession = false;
    if(m_TimeManager != NULL)
    {
-      bool notDeadZone = !m_TimeManager->IsDeadZone();
-      bool notLondon = !m_TimeManager->IsLondonSession();
+      bool isDeadZone = (*m_TimeManager).IsDeadZone();
+      bool isLondon = (*m_TimeManager).IsLondonSession();
+      bool notDeadZone = !isDeadZone;
+      bool notLondon = !isLondon;
       pastLondonSession = (notDeadZone && notLondon);
    }
    
@@ -249,7 +252,7 @@ bool CDeadZoneManager::CanEnterTrade(double currentPrice, bool isLongSetup)
       return false;
    }
    
-   bool inLondonSession = m_TimeManager->IsLondonSession();
+   bool inLondonSession = (*m_TimeManager).IsLondonSession();
    if(!inLondonSession)
    {
       return false;

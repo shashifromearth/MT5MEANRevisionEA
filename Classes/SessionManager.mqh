@@ -13,11 +13,14 @@ private:
    CLogger* m_Logger;
    
    int m_TradesToday;
+   int m_TradesThisSession;  // Trades in current session (London or NY)
    int m_LossesToday;
+   int m_LossesThisSession;  // Losses in current session
    datetime m_LastTradeTime;
    datetime m_LastLossTime;
    datetime m_LastResetDate;
    string m_CurrentSession;
+   string m_LastSession;
    
    bool IsNewDay();
    void ResetDaily();
@@ -45,11 +48,17 @@ CSessionManager::CSessionManager(int maxTrades, bool enableCooldown, int cooldow
    m_LossCoolDownMinutes = cooldownMinutes;
    m_Logger = logger;
    m_TradesToday = 0;
+   m_TradesThisSession = 0;
    m_LossesToday = 0;
+   m_LossesThisSession = 0;
    m_LastTradeTime = 0;
    m_LastLossTime = 0;
    m_LastResetDate = 0;
    m_CurrentSession = "";
+   m_LastSession = "";
+   
+   // Initialize daily reset on startup
+   ResetDaily();
 }
 
 //+------------------------------------------------------------------+
@@ -70,19 +79,32 @@ bool CSessionManager::CanTrade()
       ResetDaily();
    }
    
-   // Check max trades per session
-   if(m_TradesToday >= m_MaxTradesPerSession)
+   // Check session change and reset session counters
+   string currentSession = GetCurrentSession();
+   if(currentSession != m_CurrentSession && currentSession != "")
    {
-      (*m_Logger).LogInfo(StringFormat("Max trades per session reached: %d", m_TradesToday));
+      // New session started - reset session counters
+      m_LastSession = m_CurrentSession;
+      m_CurrentSession = currentSession;
+      m_TradesThisSession = 0;
+      m_LossesThisSession = 0;
+      (*m_Logger).LogInfo(StringFormat("New session started: %s - Session counters reset", currentSession));
+   }
+   
+   // Check max trades per session (2 trades per session)
+   if(m_TradesThisSession >= m_MaxTradesPerSession)
+   {
+      (*m_Logger).LogInfo(StringFormat("Max trades per session reached: %d/%d (Session: %s)", 
+                                      m_TradesThisSession, m_MaxTradesPerSession, m_CurrentSession));
       return false;
    }
    
-   // Check loss cooldown
-   if(m_EnableLossCoolDown && m_LossesToday > 0)
+   // Check loss cooldown (per session)
+   if(m_EnableLossCoolDown && m_LossesThisSession > 0)
    {
-      if(m_LossesToday >= 2)
+      if(m_LossesThisSession >= 2)
       {
-         (*m_Logger).LogWarning("2 losses in session - trading stopped for this session");
+         (*m_Logger).LogWarning(StringFormat("2 losses in session (%s) - trading stopped for this session", m_CurrentSession));
          return false;
       }
       
@@ -93,8 +115,8 @@ bool CSessionManager::CanTrade()
          
          if(minutesSinceLoss < m_LossCoolDownMinutes)
          {
-            (*m_Logger).LogInfo(StringFormat("In cooldown period: %d minutes remaining", 
-                                          m_LossCoolDownMinutes - minutesSinceLoss));
+            (*m_Logger).LogInfo(StringFormat("In cooldown period: %d minutes remaining (Session: %s)", 
+                                          m_LossCoolDownMinutes - minutesSinceLoss, m_CurrentSession));
             return false;
          }
       }
@@ -109,9 +131,11 @@ bool CSessionManager::CanTrade()
 void CSessionManager::OnTrade()
 {
    m_TradesToday++;
+   m_TradesThisSession++;
    m_LastTradeTime = TimeCurrent();
    
-   (*m_Logger).LogInfo(StringFormat("Trade executed. Total trades today: %d", m_TradesToday));
+   (*m_Logger).LogInfo(StringFormat("Trade executed. Session: %s | Trades this session: %d/%d | Total today: %d", 
+                                   m_CurrentSession, m_TradesThisSession, m_MaxTradesPerSession, m_TradesToday));
 }
 
 //+------------------------------------------------------------------+
@@ -120,13 +144,15 @@ void CSessionManager::OnTrade()
 void CSessionManager::OnLoss()
 {
    m_LossesToday++;
+   m_LossesThisSession++;
    m_LastLossTime = TimeCurrent();
    
-   (*m_Logger).LogWarning(StringFormat("Trade loss recorded. Total losses today: %d", m_LossesToday));
+   (*m_Logger).LogWarning(StringFormat("Trade loss recorded. Session: %s | Losses this session: %d | Total today: %d", 
+                                       m_CurrentSession, m_LossesThisSession, m_LossesToday));
    
-   if(m_LossesToday >= 2)
+   if(m_LossesThisSession >= 2)
    {
-      (*m_Logger).LogWarning("2 losses reached - trading stopped for this session");
+      (*m_Logger).LogWarning(StringFormat("2 losses in session (%s) - trading stopped for this session", m_CurrentSession));
    }
 }
 
@@ -171,11 +197,15 @@ void CSessionManager::ResetDaily()
    m_LastResetDate = StringToTime(StringFormat("%04d.%02d.%02d", dt.year, dt.mon, dt.day));
    
    m_TradesToday = 0;
+   m_TradesThisSession = 0;
    m_LossesToday = 0;
+   m_LossesThisSession = 0;
    m_LastTradeTime = 0;
    m_LastLossTime = 0;
+   m_CurrentSession = "";
+   m_LastSession = "";
    
-   (*m_Logger).LogInfo("Daily reset: Session counters reset");
+   (*m_Logger).LogInfo("Daily reset: All counters reset");
 }
 
 //+------------------------------------------------------------------+

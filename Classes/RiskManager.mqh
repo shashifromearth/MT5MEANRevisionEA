@@ -185,10 +185,10 @@ bool CRiskManager::ValidateRiskReward(bool isLong, double entryPrice, double sto
 {
    double rr = CalculateRiskReward(isLong, entryPrice, stopLoss, takeProfit);
    
-   // RR must be between 0.5 and 1.0 (1:0.5 to 1:1)
-   if(rr < 0.5 || rr > 1.0)
+   // RELAXED: RR must be between 0.3 and 1.5 (1:0.3 to 1:1.5) - was 0.5 to 1.0
+   if(rr < 0.3 || rr > 1.5)
    {
-      (*m_Logger).LogWarning(StringFormat("RR validation failed: %.2f (required: 0.5-1.0)", rr));
+      (*m_Logger).LogWarning(StringFormat("RR validation failed: %.2f (required: 0.3-1.5)", rr));
       return false;
    }
    
@@ -216,10 +216,27 @@ void CRiskManager::OnTrade()
 //+------------------------------------------------------------------+
 void CRiskManager::MonitorPositions(CMeanCalculator* meanCalculator)
 {
-   if(!PositionSelect(m_Symbol)) return;
+   // Check for EA position with magic number filter
+   ulong ticket = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong posTicket = PositionGetTicket(i);
+      if(posTicket > 0)
+      {
+         if(PositionSelectByTicket(posTicket))
+         {
+            if(PositionGetString(POSITION_SYMBOL) == m_Symbol && 
+               PositionGetInteger(POSITION_MAGIC) == 123456)
+            {
+               ticket = posTicket;
+               break;
+            }
+         }
+      }
+   }
    
-   ulong ticket = PositionGetInteger(POSITION_TICKET);
    if(ticket == 0) return;
+   if(!PositionSelectByTicket(ticket)) return;
    
    bool shouldClose = false;
    string closeReason = "";
@@ -240,11 +257,18 @@ void CRiskManager::MonitorPositions(CMeanCalculator* meanCalculator)
    
    if(shouldClose)
    {
-      // Close position
+      // Close position - CRITICAL: Must specify position ticket
+      if(!PositionSelectByTicket(ticket))
+      {
+         // Position already closed, skip
+         return;
+      }
+      
       MqlTradeRequest request = {};
       MqlTradeResult result = {};
       
       request.action = TRADE_ACTION_DEAL;
+      request.position = ticket; // CRITICAL: Specify which position to close
       request.symbol = m_Symbol;
       request.volume = PositionGetDouble(POSITION_VOLUME);
       request.type = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
@@ -258,7 +282,12 @@ void CRiskManager::MonitorPositions(CMeanCalculator* meanCalculator)
       }
       else
       {
-         (*m_Logger).LogError(StringFormat("Failed to close position %llu: %s", ticket, result.comment));
+         (*m_Logger).LogError(StringFormat("Failed to close position %llu: %s (retcode: %d)", ticket, result.comment, result.retcode));
+         // If "No money" error, stop trying to close (infinite loop prevention)
+         if(result.retcode == 10004 || result.retcode == 10019) // TRADE_RETCODE_NO_MONEY or TRADE_RETCODE_NOT_ENOUGH_MONEY
+         {
+            (*m_Logger).LogWarning("Insufficient margin to close position - will retry when margin available");
+         }
       }
    }
 }
